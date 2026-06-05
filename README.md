@@ -14,17 +14,8 @@
 
 </div>
 
-<div align="center">
-
-[![Use at your own risk](https://img.shields.io/badge/%E2%9A%A0%20USE%20AT%20YOUR%20OWN%20RISK-NO%20WARRANTY%20%C2%B7%20NO%20LIABILITY-F4C20D?style=for-the-badge&labelColor=B8860B)](#-disclaimer)
-
-</div>
-
-> [!CAUTION]
-> **Legal disclaimer.** This tool performs powerful, **irreversible** administrative actions against a live Microsoft 365 tenant. It is provided free of charge, "as is" and "as available", with **no warranty of any kind**. **You use it entirely at your own risk and are solely responsible for any outcome.** To the maximum extent permitted by law, the author and contributors accept **no liability** and **cannot be held legally responsible** for any damage, data loss, lockout, or disruption arising from its use. Read the full [Disclaimer](#-disclaimer) before you run it.
-
 > [!NOTE]
-> Not affiliated with or endorsed by Microsoft. Always test against a non-production account in your own tenant first, double-click **`demo.bat`** for a safe, no-sign-in walkthrough.
+> Not affiliated with or endorsed by Microsoft. Provided under the [MIT License](LICENSE) with no warranty, see the [Disclaimer](#-disclaimer). Always test against a non-production account in your own tenant first, double-click **`demo.bat`** for a safe, no-sign-in walkthrough.
 
 ---
 
@@ -384,6 +375,8 @@ Routes: `GET /health`, `POST /preview`, `POST /rehire`, `POST /offboard`, `POST 
 [![Use at your own risk](https://img.shields.io/badge/%E2%9A%A0%20USE%20AT%20YOUR%20OWN%20RISK-NO%20WARRANTY%20%C2%B7%20NO%20LIABILITY-F4C20D?style=for-the-badge&labelColor=B8860B)](#-disclaimer)
 
 </div>
+
+> The binding legal terms for this software are in the **[MIT License](LICENSE)**, which is the governing legal instrument. The disclaimer below restates and expands on its no-warranty and no-liability provisions in plain language; it supplements, and does not replace, that license.
 
 **No warranty.** This software is provided free of charge, **"AS IS"** and **"AS AVAILABLE"**, without warranty of any kind, whether express, implied, or statutory, including but not limited to the implied warranties of merchantability, fitness for a particular purpose, title, and non-infringement. The author does not warrant that the software is error-free or secure, that it will operate without interruption, or that it will meet your requirements or produce any particular result.
 
