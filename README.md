@@ -112,6 +112,18 @@ Preview without making changes (the script supports `-WhatIf`):
 .\Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits -All -WhatIf
 ```
 
+### Training / dry-run mode
+
+To learn or demonstrate the tool with no risk, use `-DryRun`. It walks through all ten steps, narrates exactly what each one would do and which cmdlets it uses, and writes a clearly marked sample audit packet, but it never signs in, never touches the tenant, and makes no change. It needs no admin account and works offline on any platform (including Cloud Shell).
+
+```powershell
+.\Invoke-M365Offboarding.ps1 -DryRun
+```
+
+The sample packet's `audit.json` is tagged `"dryRun": true`, and `AUDIT.md` is headed as a training run. Dry-run records are ignored by the rehire check and the re-run guard, so practising never affects real detection.
+
+Difference from `-WhatIf`: `-WhatIf` makes a real connection and reads real data for a specific account but applies no changes; `-DryRun` is fully simulated with no sign-in or account required.
+
 ### Unattended (automation)
 
 App-only certificate auth, no prompts, JSON output. Suitable for a scheduled task, an AI agent tool call, or a backend service:
@@ -183,6 +195,7 @@ Uploading uses the Microsoft Graph token already established at sign-in and need
 | `-AuditRoot` | Parent folder for the audit packet. |
 | `-Steps 1,2,3` | Run only these step numbers. |
 | `-All` | Run all ten steps without the menu. |
+| `-DryRun` | Training mode: simulate all steps, no sign-in, no changes. |
 | `-Unattended` | No prompts. Requires `-UserPrincipalName` and `-AuditRoot`. |
 | `-NoScreenshots` | Skip screenshot capture. |
 | `-ForwardingAddress` | Configure forwarding in step 7. |
@@ -257,7 +270,6 @@ Write the result for automation with `-JsonOutPath`. The offboarding tool also p
 
 ## Roadmap
 
-- A dry-run / training mode that exercises every step against a dummy account.
 - A thin REST wrapper and an AI-agent tool manifest built on the existing `audit.json` contract (see [docs/INTEGRATION.md](docs/INTEGRATION.md)).
 
 ## License

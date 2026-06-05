@@ -50,6 +50,14 @@
 .PARAMETER All
     Run all ten steps in order without showing the menu (interactive mode).
 
+.PARAMETER DryRun
+    Training mode. Walks through all ten steps and narrates exactly what each one
+    would do (and which cmdlets it uses) WITHOUT signing in, touching the tenant,
+    or making any change. Produces a clearly marked sample audit packet. Works
+    offline and on any platform. Use this to learn or demonstrate the tool. For a
+    live preview against a real account that reads real data but makes no changes,
+    use -WhatIf instead.
+
 .PARAMETER Unattended
     No prompts. Requires -UserPrincipalName and -AuditRoot. Runs the requested
     steps (all ten by default) and exits. Combine with app-only auth parameters
@@ -146,6 +154,7 @@ param(
     [string]$AuditRoot,
     [ValidateRange(1, 10)][int[]]$Steps,
     [switch]$All,
+    [switch]$DryRun,
     [switch]$Unattended,
     [switch]$NoScreenshots,
     [string]$ForwardingAddress,
@@ -503,13 +512,19 @@ function Add-AuditEntry {
 }
 
 function Write-AuditMarkdown {
-    param([string]$OutputFolder, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl)
+    param([string]$OutputFolder, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl, [bool]$DryRun)
 
     $startTime = $script:AuditLog | Select-Object -First 1 -ExpandProperty Timestamp
     $endTime   = $script:AuditLog | Select-Object -Last 1 -ExpandProperty Timestamp
 
     $sb = [System.Text.StringBuilder]::new()
-    [void]$sb.AppendLine('# Microsoft 365 Offboarding Audit Packet')
+    if ($DryRun) {
+        [void]$sb.AppendLine('# Microsoft 365 Offboarding Audit Packet (DRY RUN / TRAINING)')
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine('> **This is a training dry run. No sign-in occurred and no changes were made.** It shows what a real offboarding would do.')
+    } else {
+        [void]$sb.AppendLine('# Microsoft 365 Offboarding Audit Packet')
+    }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('## Identification')
     [void]$sb.AppendLine('')
@@ -564,11 +579,12 @@ function Write-AuditMarkdown {
 }
 
 function Write-AuditJson {
-    param([string]$Path, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl)
+    param([string]$Path, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl, [bool]$DryRun)
 
     $obj = [ordered]@{
         tool            = 'Invoke-M365Offboarding'
         schemaVersion   = '1.0'
+        dryRun          = $DryRun
         targetUpn       = $TargetUpn
         performedBy     = $Operator
         offboardingDate = (Get-Date -Format 'yyyy-MM-dd')
@@ -1085,6 +1101,77 @@ function Invoke-StepByNumber {
     }
 }
 
+# ----------------------------------------------------------------
+# Dry-run / training mode: narrate each step, make no changes.
+# ----------------------------------------------------------------
+$script:StepInfo = @{
+    1  = @{ Title = 'Reset password and revoke all sign-in sessions'; Action = 'Reset password and revoked all sign-in sessions'
+            Why = 'Stops new sign-ins and invalidates issued refresh tokens.'
+            Cmdlets = 'Update-MgUser (passwordProfile); Revoke-MgUserSignInSession'
+            Sim = 'Password reset to a random value; all sessions revoked.' }
+    2  = @{ Title = 'Block sign-in (disable the account)'; Action = 'Set AccountEnabled to false'
+            Why = 'Prevents the account from authenticating.'
+            Cmdlets = 'Update-MgUser -AccountEnabled:$false'
+            Sim = 'AccountEnabled set to false.' }
+    3  = @{ Title = 'Remove ActiveSync mobile device partnerships'; Action = 'Removed ActiveSync mobile device partnerships'
+            Why = 'Stops cached mobile clients from repeatedly trying to refresh tokens.'
+            Cmdlets = 'Get-MobileDevice; Remove-MobileDevice'
+            Sim = '2 partnerships would be removed.' }
+    4  = @{ Title = 'Remove registered authentication (MFA) methods'; Action = 'Removed registered authentication (MFA) methods'
+            Why = 'Clears stale MFA registrations.'
+            Cmdlets = 'Get-MgUserAuthenticationMethod; Remove-MgUserAuthentication*Method'
+            Sim = '2 methods (Authenticator, phone) would be removed; password kept.' }
+    5  = @{ Title = 'Revoke OAuth app grants'; Action = 'Revoked OAuth2 grants'
+            Why = 'Removes third-party app access tied to the account.'
+            Cmdlets = 'Get-MgUserOauth2PermissionGrant; Remove-MgOauth2PermissionGrant'
+            Sim = '2 delegated grants would be revoked.' }
+    6  = @{ Title = 'Remove from groups and distribution lists'; Action = 'Removed user from cloud-managed groups'
+            Why = 'Stops inherited access and mail; on-prem-synced groups are skipped.'
+            Cmdlets = 'Get-MgUserMemberOf; Remove-MgGroupMemberByRef'
+            Sim = '4 cloud-managed groups would be removed.' }
+    7  = @{ Title = 'Configure forwarding and delegation (optional)'; Action = 'Configured forwarding / delegation'
+            Why = 'Keeps the work flowing if requested.'
+            Cmdlets = 'Set-Mailbox -ForwardingSmtpAddress; Add-MailboxPermission; Add-RecipientPermission'
+            Sim = 'No forwarding or delegation requested (training default).' }
+    8  = @{ Title = 'Convert user mailbox to a shared mailbox'; Action = 'Converted user mailbox to shared mailbox'
+            Why = 'Preserves mail and calendar; must happen BEFORE the license is removed.'
+            Cmdlets = 'Set-Mailbox -Type Shared'
+            Sim = 'RecipientTypeDetails would become SharedMailbox.' }
+    9  = @{ Title = 'Remove Microsoft 365 licenses'; Action = 'Removed all Microsoft 365 licenses'
+            Why = 'Safe now that the mailbox is shared; the account remains as the anchor.'
+            Cmdlets = 'Set-MgUserLicense -RemoveLicenses'
+            Sim = '1 license SKU would be removed.' }
+    10 = @{ Title = 'Apply a Conditional Access block on the user principal'; Action = "Added user to the offboarded group (targeted by CA block)"
+            Why = 'Defense in depth: blocks sign-in even if the account is re-enabled.'
+            Cmdlets = 'New-MgGroup; New-MgGroupMember; New-MgIdentityConditionalAccessPolicy'
+            Sim = "User would be added to '$OffboardedGroupName'; report-only CA policy ensured." }
+}
+
+function Invoke-DryRunStep {
+    param([int]$Number, [string]$Upn)
+    $info = $script:StepInfo[$Number]
+    Write-StepHeader $Number $info.Title
+    Write-Host '  [DRY RUN] No change will be made.' -ForegroundColor Magenta
+    Write-Info $info.Why
+    Write-Action "Would run: $($info.Cmdlets)"
+    Write-Ok "Simulated result: $($info.Sim)"
+    Add-AuditEntry -StepNumber $Number -Action $info.Action -Result 'Dry run (no change)' `
+        -Details "DRY RUN, no change made. Would execute: $($info.Cmdlets). $($info.Sim)"
+}
+
+function Get-DryRunFinalState {
+    param([string]$Upn)
+    return [ordered]@{
+        'User principal name'         = $Upn
+        'Display name'                = '(training account)'
+        'Account enabled'             = $false
+        'Assigned licenses'           = 'None'
+        'Recipient type details'      = 'SharedMailbox'
+        'Forwarding address'          = 'None'
+        'Mobile device partnerships'  = 0
+    }
+}
+
 function Invoke-StepList {
     param([int[]]$Numbers, [string]$Upn, [string]$Folder, [bool]$StopOnError)
     foreach ($n in $Numbers) {
@@ -1153,6 +1240,7 @@ function Test-PriorOffboarding {
     $jsonFiles = Get-ChildItem -Path $Root -Filter 'audit.json' -Recurse -File -ErrorAction SilentlyContinue
     foreach ($f in $jsonFiles) {
         try { $d = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        if ($d.dryRun) { continue }
         if ($d.tool -eq 'Invoke-M365Offboarding' -and "$($d.targetUpn)".ToLower() -eq $Upn.ToLower()) {
             $hits += [PSCustomObject]@{ Date = "$($d.offboardingDate)"; Path = $f.FullName }
         }
@@ -1165,56 +1253,77 @@ function Main {
 
     if (-not $Unattended) {
         Clear-Host
-        Write-Banner 'MICROSOFT 365 USER OFFBOARDING' 'Green'
-        Write-Host '  Before starting:' -ForegroundColor Yellow
-        Write-Host '    1. Confirm the offboarding is approved.'
-        Write-Host '    2. Have an admin account with the required permissions ready.'
-        if ($script:ScreenshotMode -eq 'windows') {
-            Write-Host '    3. Close personal windows. Screenshots capture all monitors.'
-        }
-        Write-Host ''
-
-        # Be clear about screenshots when there is no graphical desktop.
-        if ($script:ScreenshotMode -eq 'none' -and -not $NoScreenshots) {
-            if ($script:IsCloudShell) {
-                Write-WarnMsg 'Running in Azure Cloud Shell: this is a headless environment with no'
-                Write-Info   'graphical desktop, so per-step screenshots cannot be captured here.'
-            } elseif (-not $script:IsWindowsHost -and -not $script:HasDisplay) {
-                Write-WarnMsg 'No graphical desktop detected: per-step screenshots cannot be captured.'
+        if ($DryRun) {
+            Write-Banner 'DRY RUN / TRAINING MODE' 'Magenta'
+            Write-Host '  No sign-in occurs and nothing in the tenant is changed.' -ForegroundColor Magenta
+            Write-Host '  This walks through all ten steps and shows what each would do.' -ForegroundColor Magenta
+            Write-Host ''
+            $proceed = Read-Host '  Type TRAIN to continue, or anything else to exit'
+            if ($proceed -ne 'TRAIN') { Write-Host '  Aborted.' -ForegroundColor Yellow; return }
+        } else {
+            Write-Banner 'MICROSOFT 365 USER OFFBOARDING' 'Green'
+            Write-Host '  Before starting:' -ForegroundColor Yellow
+            Write-Host '    1. Confirm the offboarding is approved.'
+            Write-Host '    2. Have an admin account with the required permissions ready.'
+            if ($script:ScreenshotMode -eq 'windows') {
+                Write-Host '    3. Close personal windows. Screenshots capture all monitors.'
             }
-            if ($script:ScreenshotMode -eq 'none') {
+            Write-Host ''
+
+            # Be clear about screenshots when there is no graphical desktop.
+            if ($script:ScreenshotMode -eq 'none' -and -not $NoScreenshots) {
+                if ($script:IsCloudShell) {
+                    Write-WarnMsg 'Running in Azure Cloud Shell: this is a headless environment with no'
+                    Write-Info   'graphical desktop, so per-step screenshots cannot be captured here.'
+                } elseif (-not $script:IsWindowsHost -and -not $script:HasDisplay) {
+                    Write-WarnMsg 'No graphical desktop detected: per-step screenshots cannot be captured.'
+                }
                 Write-Info 'The audit packet will still include AUDIT.md, audit.json, and a text'
                 Write-Info 'transcript of this session. If your audit policy requires images, take a'
                 Write-Info 'screenshot of your own screen (for example the browser) and keep it with'
                 Write-Info 'the ticket, or run the tool on a Windows desktop for automatic screenshots.'
             }
+
+            # On a Linux desktop with no capture tool, offer to install one.
+            Request-ScreenshotToolInstall
+
+            Write-Host ''
+            $proceed = Read-Host '  Type START to continue, or anything else to exit'
+            if ($proceed -ne 'START') { Write-Host '  Aborted.' -ForegroundColor Yellow; return }
         }
-
-        # On a Linux desktop with no capture tool, offer to install one.
-        Request-ScreenshotToolInstall
-
-        Write-Host ''
-        $proceed = Read-Host '  Type START to continue, or anything else to exit'
-        if ($proceed -ne 'START') { Write-Host '  Aborted.' -ForegroundColor Yellow; return }
+    } elseif ($DryRun) {
+        Write-Banner 'DRY RUN / TRAINING MODE - NO CHANGES WILL BE MADE' 'Magenta'
     }
 
     # Resolve inputs
     $upn = $UserPrincipalName
     if (-not $upn) {
-        if ($Unattended) { throw '-UserPrincipalName is required in unattended mode.' }
-        $upn = Get-TargetUserInteractive
+        if ($DryRun) {
+            $upn = 'trainee@contoso.com'
+            Write-Info "Dry run using sample user: $upn"
+        } elseif ($Unattended) {
+            throw '-UserPrincipalName is required in unattended mode.'
+        } else {
+            $upn = Get-TargetUserInteractive
+        }
     }
     if ($upn -notmatch '@') { throw "Invalid UserPrincipalName: $upn" }
 
     $root = $AuditRoot
     if (-not $root) {
-        if ($Unattended) { throw '-AuditRoot is required in unattended mode.' }
-        $root = Get-AuditRootFolderInteractive
+        if ($DryRun) {
+            $root = Join-Path ([System.IO.Path]::GetTempPath()) 'M365Offboarding-DryRun'
+            Write-Info "Dry run audit packet will be written under: $root"
+        } elseif ($Unattended) {
+            throw '-AuditRoot is required in unattended mode.'
+        } else {
+            $root = Get-AuditRootFolderInteractive
+        }
     }
     if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
 
-    # Rehire / re-run guard: warn if this user was offboarded before.
-    $prior = @(Test-PriorOffboarding -Root $root -Upn $upn)
+    # Rehire / re-run guard: warn if this user was offboarded before (not in dry run).
+    $prior = if ($DryRun) { @() } else { @(Test-PriorOffboarding -Root $root -Upn $upn) }
     if ($prior.Count) {
         Write-Banner 'PRIOR OFFBOARDING DETECTED' 'Yellow'
         Write-WarnMsg "This user was offboarded before ($($prior.Count) record(s)):"
@@ -1230,9 +1339,9 @@ function Main {
     $auditFolder = Resolve-AuditFolder -Root $root -Upn $upn
     Write-Ok "Audit folder: $auditFolder"
 
-    # When screenshots are not available (for example Cloud Shell), capture a text
-    # transcript of the session as the audit evidence substitute.
-    if ($script:ScreenshotMode -eq 'none') {
+    # When screenshots are not available (Cloud Shell) or in a dry run, capture a
+    # text transcript of the session as the audit evidence substitute.
+    if ($script:ScreenshotMode -eq 'none' -or $DryRun) {
         try {
             Start-Transcript -Path (Join-Path $auditFolder 'transcript.txt') -Append | Out-Null
             $script:TranscriptOn = $true
@@ -1240,39 +1349,48 @@ function Main {
         } catch { }
     }
 
-    Initialize-Modules
-    $operator = Connect-Services
-    Add-AuditEntry -StepNumber 0 -Action 'Connected to Microsoft Graph and Exchange Online' -Result "Authenticated as $operator" `
-        -Details "Target: $upn."
-
-    # Decide which steps to run
     $allSteps = 1..10
-    if ($Unattended -or $All -or $Steps) {
+
+    if ($DryRun) {
+        # Training mode: no modules, no sign-in, no tenant calls.
+        $operator = 'DRY RUN (no sign-in)'
+        Add-AuditEntry -StepNumber 0 -Action 'Dry run started (no sign-in)' -Result 'Dry run (no change)' -Details "Target (sample): $upn. No connection was made."
         $toRun = if ($Steps) { $Steps } else { $allSteps }
-        Invoke-StepList -Numbers $toRun -Upn $upn -Folder $auditFolder -StopOnError:$false
+        foreach ($n in $toRun) { Invoke-DryRunStep -Number $n -Upn $upn }
     } else {
-        while ($true) {
-            $choice = (Show-StepMenu -Upn $upn).ToUpper().Trim()
-            if ($choice -eq 'Q') { break }
-            if ($choice -eq 'A') { Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false; break }
-            if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le 10) {
-                Invoke-StepList -Numbers @([int]$choice) -Upn $upn -Folder $auditFolder -StopOnError:$false
-            } else {
-                Write-WarnMsg 'Invalid choice. Use 1-10, A, or Q.'
+        Initialize-Modules
+        $operator = Connect-Services
+        Add-AuditEntry -StepNumber 0 -Action 'Connected to Microsoft Graph and Exchange Online' -Result "Authenticated as $operator" `
+            -Details "Target: $upn."
+
+        # Decide which steps to run
+        if ($Unattended -or $All -or $Steps) {
+            $toRun = if ($Steps) { $Steps } else { $allSteps }
+            Invoke-StepList -Numbers $toRun -Upn $upn -Folder $auditFolder -StopOnError:$false
+        } else {
+            while ($true) {
+                $choice = (Show-StepMenu -Upn $upn).ToUpper().Trim()
+                if ($choice -eq 'Q') { break }
+                if ($choice -eq 'A') { Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false; break }
+                if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le 10) {
+                    Invoke-StepList -Numbers @([int]$choice) -Upn $upn -Folder $auditFolder -StopOnError:$false
+                } else {
+                    Write-WarnMsg 'Invalid choice. Use 1-10, A, or Q.'
+                }
             }
         }
     }
 
     # Audit packet
     Write-Banner 'GENERATING AUDIT PACKET'
-    $finalState = Get-FinalState -Upn $upn
+    $finalState = if ($DryRun) { Get-DryRunFinalState -Upn $upn } else { Get-FinalState -Upn $upn }
     $folderJson = Join-Path $auditFolder 'audit.json'
 
-    # Decide whether and where to upload to SharePoint.
+    # Decide whether and where to upload to SharePoint (never in dry run).
     $spSite = $SharePointSiteUrl
     $spFolder = $SharePointFolderPath
     $doUpload = $false
-    if (-not $SkipSharePointUpload) {
+    if (-not $DryRun -and -not $SkipSharePointUpload) {
         if ($spSite) {
             $doUpload = $true
         } elseif (-not $Unattended) {
@@ -1305,8 +1423,8 @@ function Main {
     }
 
     # Write the audit files (embedding the SharePoint link when known).
-    $auditPath = Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl
-    Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl | Out-Null
+    $auditPath = Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl -DryRun $DryRun
+    Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl -DryRun $DryRun | Out-Null
     Write-Ok "Wrote $auditPath"
     Write-Ok "Wrote $folderJson"
     if ($JsonOutPath -and ($JsonOutPath -ne $folderJson)) {
@@ -1327,28 +1445,34 @@ function Main {
             Write-WarnMsg "SharePoint upload failed: $_"
             $spUrl = $null
             # Rewrite the local audit files so they do not falsely claim a SharePoint copy.
-            Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState | Out-Null
-            Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState | Out-Null
+            Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -DryRun $DryRun | Out-Null
+            Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState -DryRun $DryRun | Out-Null
             if ($JsonOutPath -and ($JsonOutPath -ne $folderJson)) { Copy-Item -Path $folderJson -Destination $JsonOutPath -Force }
         }
     }
 
-    if (-not $spUrl) {
-        Write-Banner 'UPLOAD TO SHAREPOINT' 'Yellow'
-        Write-Info 'The audit packet was not uploaded to SharePoint.'
-        Write-Info 'Please upload this folder to SharePoint for later review:'
-        Write-Host "    $auditFolder" -ForegroundColor Yellow
+    if ($DryRun) {
+        Write-Banner 'DRY RUN COMPLETE - NO CHANGES WERE MADE' 'Magenta'
+        Write-Host "  Sample audit packet: $auditFolder" -ForegroundColor Magenta
+        Write-Info 'Review AUDIT.md and audit.json to see what a real run produces.'
+        Write-Info 'When ready, run a real offboarding (optionally with -WhatIf first).'
+    } else {
+        if (-not $spUrl) {
+            Write-Banner 'UPLOAD TO SHAREPOINT' 'Yellow'
+            Write-Info 'The audit packet was not uploaded to SharePoint.'
+            Write-Info 'Please upload this folder to SharePoint for later review:'
+            Write-Host "    $auditFolder" -ForegroundColor Yellow
+        }
+        Write-Banner 'COMPLETE' 'Green'
+        Write-Host "  Audit folder: $auditFolder" -ForegroundColor Green
+        if ($spUrl) { Write-Host "  SharePoint:   $spUrl" -ForegroundColor Green }
     }
-
-    Write-Banner 'COMPLETE' 'Green'
-    Write-Host "  Audit folder: $auditFolder" -ForegroundColor Green
-    if ($spUrl) { Write-Host "  SharePoint:   $spUrl" -ForegroundColor Green }
 
     if (-not $Unattended -and $script:IsWindowsHost) {
         try { Start-Process explorer.exe $auditFolder } catch { }
     }
 
-    Disconnect-Services
+    if (-not $DryRun) { Disconnect-Services }
 }
 
 try {

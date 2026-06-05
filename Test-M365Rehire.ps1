@@ -132,6 +132,7 @@ function Get-OffboardingMatch {
     # for the given UPN or display name; otherwise $null.
     param($Data, [string]$Source, [string]$Path, [string]$Upn, [string]$Name)
     if ($Data.tool -ne 'Invoke-M365Offboarding') { return $null }
+    if ($Data.dryRun) { return $null }   # training records are not real offboardings
     $recordUpn  = "$($Data.targetUpn)"
     $recordName = "$($Data.finalState.'Display name')"
     $upnMatch  = $Upn  -and $recordUpn  -and ($recordUpn.ToLower()  -eq $Upn.ToLower())
