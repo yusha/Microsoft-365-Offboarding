@@ -204,10 +204,32 @@ It runs interactively or unattended (app-only auth), supports `-WhatIf`, and wri
 
 **Cannot be restored automatically:** removed authentication (MFA) methods, removed mobile device (ActiveSync) partnerships, and revoked OAuth grants. The script reports these so you can have the user re-register MFA, re-add their mailbox on devices, and re-consent to apps.
 
+## Rehire detection
+
+Before onboarding a returning employee (or re-running an offboarding), check whether the person was offboarded before with `Test-M365Rehire.ps1`. It is read-only and makes no changes.
+
+```powershell
+.\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits
+.\Test-M365Rehire.ps1 -DisplayName "Jane Doe" -AuditRoot C:\Audits -SkipTenantCheck
+```
+
+It looks for evidence from two sources and prints a verdict:
+
+- **Audit history** — scans an audit root for past `audit.json` records and matches by UPN or display name.
+- **Live tenant** — finds matching accounts and flags those that look offboarded (disabled, unlicensed, in the "Offboarded Users" group, or backed by a shared mailbox). Use `-SkipTenantCheck` for a history-only check with no sign-in.
+
+| Verdict | Meaning |
+|---|---|
+| `RehireLikely` | A previously offboarded account still exists. Restore it with `Invoke-M365OffboardingReversal.ps1` instead of creating a new one. |
+| `PriorRecordOnly` | A past offboarding record exists but no matching account. The account may have been deleted (restorable for 30 days). |
+| `AccountAlreadyExists` | A matching active account exists that does not look offboarded. |
+| `NoEvidence` | Nothing found; treat as a new hire. |
+
+Write the result for automation with `-JsonOutPath`. The offboarding tool also performs a lightweight version of this check automatically: if you offboard a user who already has an offboarding record in the chosen audit root, it warns you before proceeding.
+
 ## Roadmap
 
 - A dry-run / training mode that exercises every step against a dummy account.
-- Rehire detection that warns when a display name was offboarded before.
 - A thin REST wrapper and an AI-agent tool manifest built on the existing `audit.json` contract (see [docs/INTEGRATION.md](docs/INTEGRATION.md)).
 
 ## License

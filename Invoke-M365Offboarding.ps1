@@ -1021,6 +1021,22 @@ function Resolve-AuditFolder {
     return $folder
 }
 
+function Test-PriorOffboarding {
+    # Scans the audit root for an earlier offboarding of the same UPN, so the
+    # technician is warned about a rehire-who-left-again or an accidental re-run.
+    param([string]$Root, [string]$Upn)
+    $hits = @()
+    if (-not $Root -or -not (Test-Path $Root)) { return $hits }
+    $jsonFiles = Get-ChildItem -Path $Root -Filter 'audit.json' -Recurse -File -ErrorAction SilentlyContinue
+    foreach ($f in $jsonFiles) {
+        try { $d = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        if ($d.tool -eq 'Invoke-M365Offboarding' -and "$($d.targetUpn)".ToLower() -eq $Upn.ToLower()) {
+            $hits += [PSCustomObject]@{ Date = "$($d.offboardingDate)"; Path = $f.FullName }
+        }
+    }
+    return $hits
+}
+
 function Main {
     if (-not $Unattended) {
         Clear-Host
@@ -1050,6 +1066,20 @@ function Main {
         $root = Get-AuditRootFolderInteractive
     }
     if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+
+    # Rehire / re-run guard: warn if this user was offboarded before.
+    $prior = @(Test-PriorOffboarding -Root $root -Upn $upn)
+    if ($prior.Count) {
+        Write-Banner 'PRIOR OFFBOARDING DETECTED' 'Yellow'
+        Write-WarnMsg "This user was offboarded before ($($prior.Count) record(s)):"
+        foreach ($p in $prior) { Write-Info "  $($p.Date)  -  $($p.Path)" }
+        Write-Info 'If this is a returning employee who left again, this is expected.'
+        Write-Info 'If you meant to restore them, use Invoke-M365OffboardingReversal.ps1 instead.'
+        if (-not $Unattended) {
+            $c = Read-Host '  Continue offboarding anyway? (y/N)'
+            if ($c -notmatch '^[Yy]') { Write-WarnMsg 'Aborted by operator.'; return }
+        }
+    }
 
     $auditFolder = Resolve-AuditFolder -Root $root -Upn $upn
     Write-Ok "Audit folder: $auditFolder"
