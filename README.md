@@ -175,19 +175,38 @@ Uploading uses the Microsoft Graph token already established at sign-in and need
 
 ## Reversing an offboarding
 
-If an account was offboarded by mistake:
+If an account was offboarded by mistake, use the companion script `Invoke-M365OffboardingReversal.ps1`. It restores the reversible parts in the correct order (re-enable, lift the Conditional Access block, re-license, convert the mailbox back) and clearly reports what cannot be put back.
 
-- Re-enable: `Update-MgUser -UserId <upn> -AccountEnabled:$true`
-- Remove the user from the "Offboarded Users" group
-- Re-assign the previous license SKU
-- Convert the mailbox back: `Set-Mailbox -Identity <upn> -Type Regular` (requires a license assigned first)
+Recover the original licenses straight from the offboarding record and reset the password:
 
-Mobile device partnerships, MFA registrations, and OAuth grants cannot be restored. The user re-enrolls their device, re-registers MFA, and re-consents to apps.
+```powershell
+.\Invoke-M365OffboardingReversal.ps1 -UserPrincipalName jdoe@contoso.com `
+    -FromAuditJson C:\Audits\jdoe_2026-06-05\audit.json -ResetPassword
+```
+
+Or specify the license directly (by SKU part number or GUID), or run with no license argument to pick from a list interactively:
+
+```powershell
+.\Invoke-M365OffboardingReversal.ps1 -UserPrincipalName jdoe@contoso.com -LicenseSkuPartNumber SPE_E3 -ResetPassword
+```
+
+What it restores, in order:
+
+1. Re-enable sign-in (`AccountEnabled = true`)
+2. Remove the user from the "Offboarded Users" group (lifts the Conditional Access block)
+3. Re-assign a Microsoft 365 license
+4. Convert the shared mailbox back to a regular user mailbox (a regular mailbox needs a license, so this runs after re-licensing)
+5. Reset the password (`-ResetPassword`) so the user can sign in again
+6. Clear forwarding the offboarding set (use `-KeepForwarding` to leave it)
+7. Optionally remove added Full Access / Send As delegations (`-RemoveDelegation`)
+
+It runs interactively or unattended (app-only auth), supports `-WhatIf`, and writes its own reversal record (`REVERSAL_AUDIT.md` and `reversal-audit.json`). It needs the same kind of permissions as the offboarding tool, plus `Organization.Read.All` to read the tenant's license SKUs.
+
+**Cannot be restored automatically:** removed authentication (MFA) methods, removed mobile device (ActiveSync) partnerships, and revoked OAuth grants. The script reports these so you can have the user re-register MFA, re-add their mailbox on devices, and re-consent to apps.
 
 ## Roadmap
 
 - A dry-run / training mode that exercises every step against a dummy account.
-- Automatic upload of the completed audit packet to a SharePoint location.
 - Rehire detection that warns when a display name was offboarded before.
 - A thin REST wrapper and an AI-agent tool manifest built on the existing `audit.json` contract (see [docs/INTEGRATION.md](docs/INTEGRATION.md)).
 
