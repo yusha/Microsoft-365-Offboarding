@@ -173,7 +173,8 @@ try {
     $OutputEncoding = [System.Text.Encoding]::UTF8
 } catch { }
 
-# Detect Windows. Screenshots and the folder picker are Windows-only.
+# Detect Windows. The folder picker is Windows-only; screenshot support varies
+# by platform and is resolved by Initialize-ScreenshotCapability (called in Main).
 $script:IsWindowsHost = $true
 if ($PSVersionTable.PSObject.Properties.Name -contains 'Platform') {
     if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
@@ -181,16 +182,15 @@ if ($PSVersionTable.PSObject.Properties.Name -contains 'Platform') {
     }
 }
 
-$script:CanScreenshot = $false
-if ($script:IsWindowsHost -and -not $NoScreenshots) {
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-        $script:CanScreenshot = $true
-    } catch {
-        $script:CanScreenshot = $false
-    }
-}
+# Screenshot capability, set by Initialize-ScreenshotCapability:
+#   'windows'  full-screen capture via System.Windows.Forms
+#   'linux'    capture via a CLI tool (grim/scrot/gnome-screenshot/import)
+#   'none'     no graphical desktop (for example Azure Cloud Shell)
+$script:ScreenshotMode = 'none'
+$script:ScreenshotTool = $null
+$script:IsCloudShell   = $false
+$script:HasDisplay     = $false
+$script:TranscriptOn   = $false
 
 # ================================================================
 # SECTION 1: Console output helpers
@@ -230,7 +230,12 @@ function Get-AuditRootFolderInteractive {
     if (-not $script:IsWindowsHost) {
         return (Read-Host '  Enter the parent folder path for the audit packet')
     }
+    return (Show-WindowsFolderPicker)
+}
 
+# Isolated so the WinForms type literals only compile when called on Windows.
+function Show-WindowsFolderPicker {
+    Add-Type -AssemblyName System.Windows.Forms
     $picker = New-Object System.Windows.Forms.FolderBrowserDialog
     $picker.Description = 'Select the parent folder for the audit packet'
     $picker.ShowNewFolderButton = $true
@@ -328,26 +333,144 @@ function Disconnect-Services {
     try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
 }
 
+function Stop-TranscriptSafe {
+    if ($script:TranscriptOn) {
+        try { Stop-Transcript | Out-Null } catch { }
+        $script:TranscriptOn = $false
+    }
+}
+
 # ================================================================
-# SECTION 4: Screenshot capture (Windows, all monitors)
+# SECTION 4: Screenshot capability and capture
 # ================================================================
+function Get-LinuxScreenshotTool {
+    # Returns the name of an available CLI screenshot tool, or $null.
+    $candidates = @()
+    if ($env:WAYLAND_DISPLAY) { $candidates += 'grim' }
+    $candidates += @('scrot', 'gnome-screenshot', 'import', 'spectacle')
+    foreach ($c in $candidates) {
+        if (Get-Command $c -ErrorAction SilentlyContinue) { return $c }
+    }
+    return $null
+}
+
+function Get-LinuxPackageManager {
+    foreach ($pm in @('apt-get', 'dnf', 'yum', 'zypper', 'pacman')) {
+        if (Get-Command $pm -ErrorAction SilentlyContinue) { return $pm }
+    }
+    return $null
+}
+
+function Initialize-ScreenshotCapability {
+    # Decides how (or whether) screenshots can be captured on this platform.
+    $script:IsCloudShell = ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*') -or [bool]$env:ACC_CLOUD
+    $script:HasDisplay   = [bool]($env:DISPLAY -or $env:WAYLAND_DISPLAY)
+    $script:ScreenshotMode = 'none'
+    $script:ScreenshotTool = $null
+
+    if ($NoScreenshots) { return }
+
+    if ($script:IsWindowsHost) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+            $script:ScreenshotMode = 'windows'
+        } catch {
+            $script:ScreenshotMode = 'none'
+        }
+        return
+    }
+
+    # Linux/macOS: screenshots need a graphical desktop and a capture tool.
+    if ($script:HasDisplay) {
+        $tool = Get-LinuxScreenshotTool
+        if ($tool) {
+            $script:ScreenshotMode = 'linux'
+            $script:ScreenshotTool = $tool
+        }
+    }
+}
+
+function Request-ScreenshotToolInstall {
+    # Linux desktop only: offer to install a capture tool when none is present.
+    # Never offered on a headless host (no display) such as Azure Cloud Shell.
+    if ($script:IsWindowsHost -or -not $script:HasDisplay -or $Unattended -or $NoScreenshots) { return }
+    if ($script:ScreenshotMode -ne 'none') { return }
+
+    $pm = Get-LinuxPackageManager
+    if (-not $pm) { return }
+    $pkg = if ($env:WAYLAND_DISPLAY) { 'grim' } else { 'scrot' }
+
+    Write-WarnMsg "A graphical desktop was detected but no screenshot tool is installed."
+    $ans = Read-Host "  Install '$pkg' now with sudo $pm to enable screenshots? (y/N)"
+    if ($ans -notmatch '^[Yy]') { return }
+
+    try {
+        if ($pm -eq 'apt-get') { & sudo apt-get update | Out-Null }
+        switch ($pm) {
+            'apt-get' { & sudo apt-get install -y $pkg }
+            'dnf'     { & sudo dnf install -y $pkg }
+            'yum'     { & sudo yum install -y $pkg }
+            'zypper'  { & sudo zypper --non-interactive install $pkg }
+            'pacman'  { & sudo pacman -S --noconfirm $pkg }
+        }
+        $tool = Get-LinuxScreenshotTool
+        if ($tool) {
+            $script:ScreenshotMode = 'linux'
+            $script:ScreenshotTool = $tool
+            Write-Ok "Screenshots enabled using '$tool'."
+        } else {
+            Write-WarnMsg 'Install completed but no tool was detected. Continuing without screenshots.'
+        }
+    } catch {
+        Write-WarnMsg "Install failed: $_. Continuing without screenshots."
+    }
+}
+
+# The Windows capture lives in its own function so the System.Drawing /
+# System.Windows.Forms type literals are only JIT-compiled when actually called
+# on Windows. Referencing them on a headless host (for example Azure Cloud Shell)
+# would otherwise throw a type-initializer error even on an unreached branch.
+function Save-ScreenshotWindows {
+    param([string]$Path)
+    $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+    $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $gfx.Dispose(); $bmp.Dispose()
+}
+
+function Save-ScreenshotLinux {
+    param([string]$Path)
+    switch ($script:ScreenshotTool) {
+        'grim'             { & grim $Path }
+        'scrot'            { & scrot -o $Path }
+        'gnome-screenshot' { & gnome-screenshot -f $Path }
+        'import'           { & import -window root $Path }
+        'spectacle'        { & spectacle -b -n -o $Path }
+        default            { return }
+    }
+    if (-not (Test-Path $Path)) { throw "screenshot tool '$($script:ScreenshotTool)' produced no file" }
+}
+
 function Save-Screenshot {
     param([string]$OutputFolder, [int]$StepNumber, [string]$Label)
 
-    if (-not $script:CanScreenshot) { return $null }
+    if ($script:ScreenshotMode -eq 'none') { return $null }
+
+    $safe = ($Label -replace '[^a-zA-Z0-9_-]', '_')
+    $fname = ('step_{0:D2}_{1}_{2}.png' -f $StepNumber, $safe, (Get-Date -Format 'HHmmss'))
+    $path = Join-Path $OutputFolder $fname
 
     try {
         Start-Sleep -Milliseconds 400
-        $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-        $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-        $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-
-        $safe = ($Label -replace '[^a-zA-Z0-9_-]', '_')
-        $fname = ('step_{0:D2}_{1}_{2}.png' -f $StepNumber, $safe, (Get-Date -Format 'HHmmss'))
-        $path = Join-Path $OutputFolder $fname
-        $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
-        $gfx.Dispose(); $bmp.Dispose()
+        if ($script:ScreenshotMode -eq 'windows') {
+            Save-ScreenshotWindows -Path $path
+        } else {
+            Save-ScreenshotLinux -Path $path
+        }
+        if (-not (Test-Path $path)) { return $null }
         Write-Ok "Screenshot saved: $fname"
         return $path
     } catch {
@@ -1038,15 +1161,38 @@ function Test-PriorOffboarding {
 }
 
 function Main {
+    Initialize-ScreenshotCapability
+
     if (-not $Unattended) {
         Clear-Host
         Write-Banner 'MICROSOFT 365 USER OFFBOARDING' 'Green'
         Write-Host '  Before starting:' -ForegroundColor Yellow
         Write-Host '    1. Confirm the offboarding is approved.'
         Write-Host '    2. Have an admin account with the required permissions ready.'
-        if ($script:CanScreenshot) {
+        if ($script:ScreenshotMode -eq 'windows') {
             Write-Host '    3. Close personal windows. Screenshots capture all monitors.'
         }
+        Write-Host ''
+
+        # Be clear about screenshots when there is no graphical desktop.
+        if ($script:ScreenshotMode -eq 'none' -and -not $NoScreenshots) {
+            if ($script:IsCloudShell) {
+                Write-WarnMsg 'Running in Azure Cloud Shell: this is a headless environment with no'
+                Write-Info   'graphical desktop, so per-step screenshots cannot be captured here.'
+            } elseif (-not $script:IsWindowsHost -and -not $script:HasDisplay) {
+                Write-WarnMsg 'No graphical desktop detected: per-step screenshots cannot be captured.'
+            }
+            if ($script:ScreenshotMode -eq 'none') {
+                Write-Info 'The audit packet will still include AUDIT.md, audit.json, and a text'
+                Write-Info 'transcript of this session. If your audit policy requires images, take a'
+                Write-Info 'screenshot of your own screen (for example the browser) and keep it with'
+                Write-Info 'the ticket, or run the tool on a Windows desktop for automatic screenshots.'
+            }
+        }
+
+        # On a Linux desktop with no capture tool, offer to install one.
+        Request-ScreenshotToolInstall
+
         Write-Host ''
         $proceed = Read-Host '  Type START to continue, or anything else to exit'
         if ($proceed -ne 'START') { Write-Host '  Aborted.' -ForegroundColor Yellow; return }
@@ -1083,6 +1229,16 @@ function Main {
 
     $auditFolder = Resolve-AuditFolder -Root $root -Upn $upn
     Write-Ok "Audit folder: $auditFolder"
+
+    # When screenshots are not available (for example Cloud Shell), capture a text
+    # transcript of the session as the audit evidence substitute.
+    if ($script:ScreenshotMode -eq 'none') {
+        try {
+            Start-Transcript -Path (Join-Path $auditFolder 'transcript.txt') -Append | Out-Null
+            $script:TranscriptOn = $true
+            Write-Info 'Capturing a text transcript (transcript.txt) in place of screenshots.'
+        } catch { }
+    }
 
     Initialize-Modules
     $operator = Connect-Services
@@ -1158,6 +1314,9 @@ function Main {
         Write-Ok "Copied audit.json to $JsonOutPath"
     }
 
+    # Finalize the transcript so it is complete and included in the upload.
+    Stop-TranscriptSafe
+
     # Upload the whole folder to SharePoint.
     if ($doUpload) {
         Write-Action 'Uploading audit packet to SharePoint...'
@@ -1197,6 +1356,7 @@ try {
 } catch {
     Write-ErrMsg "FATAL: $_"
     Write-Host "  $($_.ScriptStackTrace)" -ForegroundColor Red
+    Stop-TranscriptSafe
     Disconnect-Services
     if (-not $Unattended) { Read-Host 'Press ENTER to exit' }
     exit 1

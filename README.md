@@ -82,7 +82,7 @@ Step 10 is intentionally last and intentionally separate from disabling the acco
 
 ## Requirements
 
-- PowerShell 5.1 or later on Windows, or PowerShell 7 or later on any platform. Screenshot capture and the folder picker are Windows-only and are skipped automatically elsewhere.
+- PowerShell 5.1 or later on Windows, or PowerShell 7 or later on any platform. The folder picker is Windows-only (a path prompt is used elsewhere). Screenshots are captured on Windows, and on a Linux desktop when a capture tool is available; on a headless host such as Azure Cloud Shell they are replaced by a `transcript.txt`. See "Running in Azure Cloud Shell" below.
 - The following modules, installed automatically on first run if missing:
   `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Users.Actions`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Groups`, `ExchangeOnlineManagement`.
 - An account (interactive) or app registration (unattended) with these Microsoft Graph permissions, plus Exchange Online management rights:
@@ -126,15 +126,39 @@ App-only certificate auth, no prompts, JSON output. Suitable for a scheduled tas
 
 See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the app registration setup, the `audit.json` schema, and examples of calling the tool from PHP and from an AI agent.
 
+### Running in Azure Cloud Shell
+
+A Global Administrator can run the tool from the Azure Portal's Cloud Shell (the `>_` icon) instead of a local machine. Pick PowerShell, then:
+
+```powershell
+git clone https://github.com/yusha/Microsoft-365-Offboarding
+cd Microsoft-365-Offboarding
+./Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot ~/clouddrive/audits -All `
+    -SharePointSiteUrl https://contoso.sharepoint.com/sites/IT
+```
+
+Notes for Cloud Shell:
+
+- **Sign-in** uses device-code flow automatically (no browser pop-up): you get a code to enter at `microsoft.com/devicelogin`, which a Global Admin can consent to.
+- **Modules** install once with `Install-Module -Scope CurrentUser` and persist in your Cloud Shell profile.
+- **Screenshots are not captured.** Cloud Shell is a headless Linux environment with no graphical desktop, so there is no screen to capture and no component can change that. The tool detects this, says so, and instead records a text **`transcript.txt`** of the session alongside `AUDIT.md` and `audit.json`. If your audit policy requires images, take a screenshot of your own browser for the ticket, or run the tool on a Windows desktop. (Use `~/clouddrive` for persistence, or `-SharePointSiteUrl` so the packet leaves the session immediately.)
+
+On a **Linux machine with a real desktop** (an `X11` or Wayland session), screenshots *are* supported via `grim`, `scrot`, `gnome-screenshot`, or `import`. If none is installed, the tool offers to install one (with your confirmation) using the system package manager.
+
+### Azure Automation runbook
+
+For fully hands-off or scheduled offboarding, run the unattended mode from an Azure Automation PowerShell runbook with app-only certificate auth (no device-code prompt). Import the Microsoft Graph and Exchange Online modules into the Automation account, store the certificate, and call the script with `-Unattended -NoScreenshots` and the app-only parameters, writing the packet to SharePoint with `-SharePointSiteUrl`. The `audit.json` it returns is the record for each run.
+
 ## The audit packet
 
 Each run produces a folder named `<user>_<yyyy-MM-dd>` containing:
 
 ```
 jdoe_2026-06-05/
-  step_01_password_reset_and_sessions_revoked_142315.png   (Windows only)
+  step_01_password_reset_and_sessions_revoked_142315.png   (when screenshots are available)
   ...
-  step_10_conditional_access_applied_142740.png            (Windows only)
+  step_10_conditional_access_applied_142740.png            (when screenshots are available)
+  transcript.txt                                           (instead of screenshots on a headless host)
   AUDIT.md
   audit.json
 ```
