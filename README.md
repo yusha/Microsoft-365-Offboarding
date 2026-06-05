@@ -116,6 +116,8 @@ Preview without making changes (the script supports `-WhatIf`):
 
 To learn or demonstrate the tool with no risk, use `-DryRun`. It walks through all ten steps, narrates exactly what each one would do and which cmdlets it uses, and writes a clearly marked sample audit packet, but it never signs in, never touches the tenant, and makes no change. It needs no admin account and works offline on any platform (including Cloud Shell).
 
+On Windows, the quickest way to try it is to **double-click `demo.bat`**, which runs this dry run for you. Or from a shell:
+
 ```powershell
 .\Invoke-M365Offboarding.ps1 -DryRun
 ```
