@@ -605,8 +605,128 @@ function Write-AuditJson {
         success         = (-not ($script:AuditLog | Where-Object { $_.Result -like 'FAILED*' }))
     }
     $json = $obj | ConvertTo-Json -Depth 12
-    [System.IO.File]::WriteAllText($Path, $json, [System.Text.Encoding]::UTF8)
+    # Write without a BOM so strict JSON parsers (PHP json_decode, Python json,
+    # etc.) accept the file. The BOM is invisible to PowerShell's ConvertFrom-Json.
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
     return $Path
+}
+
+function ConvertTo-HtmlText {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return ($Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
+}
+
+function Get-ResultBadgeClass {
+    param([string]$Result)
+    if ($Result -like 'FAILED*')         { return 'b-fail' }
+    if ($Result -like 'Dry run*')         { return 'b-dry' }
+    if ($Result -like 'Skipped*')         { return 'b-skip' }
+    if ($Result -like 'Completed with*')  { return 'b-warn' }
+    return 'b-ok'
+}
+
+function Write-AuditHtml {
+    # Writes a self-contained, offline-viewable audit.html (inline CSS, no external
+    # resources). Screenshots are referenced by relative filename, so open the
+    # file from inside the audit folder.
+    param([string]$OutputFolder, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl, [bool]$DryRun)
+
+    $startTime = $script:AuditLog | Select-Object -First 1 -ExpandProperty Timestamp
+    $endTime   = $script:AuditLog | Select-Object -Last 1 -ExpandProperty Timestamp
+    $date      = Get-Date -Format 'yyyy-MM-dd'
+    $title     = if ($DryRun) { 'Offboarding Audit (Dry Run)' } else { 'Microsoft 365 Offboarding Audit' }
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('<!DOCTYPE html>')
+    [void]$sb.AppendLine('<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">')
+    [void]$sb.AppendLine("<title>$(ConvertTo-HtmlText $title) - $(ConvertTo-HtmlText $TargetUpn)</title>")
+    [void]$sb.AppendLine('<style>')
+    [void]$sb.AppendLine(@'
+:root{--brand:#0b5e3b;--brand2:#13935c;--ink:#1f2933;--muted:#6b7785;--line:#e6e9ee;--bg:#f5f7fa;--card:#fff;}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.55}
+.wrap{max-width:980px;margin:0 auto;padding:24px}
+header.hero{background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;border-radius:16px;padding:28px 30px;box-shadow:0 10px 30px rgba(11,94,59,.25)}
+header.hero h1{margin:0 0 6px;font-size:26px;letter-spacing:.2px}
+header.hero .sub{opacity:.92;font-size:15px}
+.dry{margin-top:16px;background:#fff3cd;color:#7a5b00;border:1px solid #ffe08a;border-left:6px solid #e0a800;border-radius:10px;padding:12px 16px;font-weight:600}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px 22px;margin:18px 0;box-shadow:0 1px 3px rgba(16,24,40,.04)}
+.card h2{margin:0 0 14px;font-size:18px;color:var(--brand)}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.4px}
+tr:last-child td{border-bottom:none}
+.kv td:first-child{color:var(--muted);width:230px;font-weight:600}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}
+.b-ok{background:#e7f7ee;color:#127a40}.b-dry{background:#e9f0ff;color:#1b50b5}.b-skip{background:#eef1f4;color:#5a6672}
+.b-warn{background:#fff4e5;color:#9a5b00}.b-fail{background:#fdecea;color:#b42318}
+.notes{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;white-space:pre-wrap;background:#fafbfc;border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:#36414c}
+.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px}
+.shots figure{margin:0;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+.shots img{display:block;width:100%;height:150px;object-fit:cover;background:#f0f2f5}
+.shots figcaption{padding:8px 10px;font-size:12px;color:var(--muted);border-top:1px solid var(--line);word-break:break-all}
+footer{color:var(--muted);font-size:12.5px;text-align:center;margin:26px 0 10px}
+a{color:var(--brand2)}
+'@)
+    [void]$sb.AppendLine('</style></head><body><div class="wrap">')
+
+    [void]$sb.AppendLine('<header class="hero">')
+    [void]$sb.AppendLine("<h1>$(ConvertTo-HtmlText $title)</h1>")
+    [void]$sb.AppendLine("<div class=`"sub`">$(ConvertTo-HtmlText $TargetUpn) &bull; $date</div>")
+    if ($DryRun) { [void]$sb.AppendLine('<div class="dry">DRY RUN / TRAINING - no sign-in occurred and no changes were made.</div>') }
+    [void]$sb.AppendLine('</header>')
+
+    # Identification
+    [void]$sb.AppendLine('<div class="card"><h2>Identification</h2><table class="kv">')
+    [void]$sb.AppendLine("<tr><td>Target user (UPN)</td><td>$(ConvertTo-HtmlText $TargetUpn)</td></tr>")
+    [void]$sb.AppendLine("<tr><td>Offboarding date</td><td>$date</td></tr>")
+    [void]$sb.AppendLine("<tr><td>Started (UTC)</td><td>$(ConvertTo-HtmlText $startTime)</td></tr>")
+    [void]$sb.AppendLine("<tr><td>Completed (UTC)</td><td>$(ConvertTo-HtmlText $endTime)</td></tr>")
+    [void]$sb.AppendLine("<tr><td>Performed by</td><td>$(ConvertTo-HtmlText $Operator)</td></tr>")
+    if ($SharePointUrl) { [void]$sb.AppendLine("<tr><td>Stored in SharePoint</td><td><a href=`"$(ConvertTo-HtmlText $SharePointUrl)`">$(ConvertTo-HtmlText $SharePointUrl)</a></td></tr>") }
+    [void]$sb.AppendLine('</table></div>')
+
+    # Timeline
+    [void]$sb.AppendLine('<div class="card"><h2>Timeline</h2><table><thead><tr><th>Time (UTC)</th><th>Step</th><th>Action</th><th>Result</th></tr></thead><tbody>')
+    foreach ($e in $script:AuditLog) {
+        $cls = Get-ResultBadgeClass $e.Result
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $e.Timestamp)</td><td>$($e.StepNumber)</td><td>$(ConvertTo-HtmlText $e.Action)</td><td><span class=`"badge $cls`">$(ConvertTo-HtmlText $e.Result)</span></td></tr>")
+    }
+    [void]$sb.AppendLine('</tbody></table></div>')
+
+    # Screenshots (relative references; open from inside the folder)
+    $shots = @($script:AuditLog | Where-Object { $_.Screenshot } | ForEach-Object { Split-Path $_.Screenshot -Leaf })
+    if ($shots.Count) {
+        [void]$sb.AppendLine('<div class="card"><h2>Screenshots</h2><div class="shots">')
+        foreach ($s in $shots) {
+            $enc = ConvertTo-HtmlText $s
+            [void]$sb.AppendLine("<figure><a href=`"$enc`"><img src=`"$enc`" alt=`"$enc`"></a><figcaption>$enc</figcaption></figure>")
+        }
+        [void]$sb.AppendLine('</div></div>')
+    }
+
+    # Detailed notes
+    [void]$sb.AppendLine('<div class="card"><h2>Detailed notes</h2>')
+    foreach ($e in ($script:AuditLog | Where-Object { $_.Details })) {
+        [void]$sb.AppendLine("<p style=`"margin:0 0 4px;font-weight:600`">Step $($e.StepNumber) &bull; $(ConvertTo-HtmlText $e.Timestamp)</p>")
+        [void]$sb.AppendLine("<div class=`"notes`">$(ConvertTo-HtmlText $e.Details)</div>")
+    }
+    [void]$sb.AppendLine('</div>')
+
+    # Final state
+    [void]$sb.AppendLine('<div class="card"><h2>Final state confirmation</h2><table class="kv">')
+    foreach ($k in $FinalState.Keys) {
+        [void]$sb.AppendLine("<tr><td>$(ConvertTo-HtmlText $k)</td><td>$(ConvertTo-HtmlText "$($FinalState[$k])")</td></tr>")
+    }
+    [void]$sb.AppendLine('</table></div>')
+
+    [void]$sb.AppendLine('<footer>Generated by the Microsoft 365 Offboarding tool. Actions were executed against the Microsoft Graph and Exchange Online APIs.</footer>')
+    [void]$sb.AppendLine('</div></body></html>')
+
+    $htmlPath = Join-Path $OutputFolder 'audit.html'
+    [System.IO.File]::WriteAllText($htmlPath, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    return $htmlPath
 }
 
 # ================================================================
@@ -1148,14 +1268,23 @@ $script:StepInfo = @{
 }
 
 function Invoke-DryRunStep {
-    param([int]$Number, [string]$Upn)
+    param([int]$Number, [string]$Upn, [string]$Folder)
     $info = $script:StepInfo[$Number]
     Write-StepHeader $Number $info.Title
     Write-Host '  [DRY RUN] No change will be made.' -ForegroundColor Magenta
     Write-Info $info.Why
     Write-Action "Would run: $($info.Cmdlets)"
     Write-Ok "Simulated result: $($info.Sim)"
-    Add-AuditEntry -StepNumber $Number -Action $info.Action -Result 'Dry run (no change)' `
+
+    # In an interactive demo, capture a sample screenshot so the packet shows
+    # what the screenshot feature produces. Skipped in unattended preview mode
+    # and on headless hosts (Save-Screenshot returns null there).
+    $shot = $null
+    if (-not $Unattended -and $Folder) {
+        $shot = Save-Screenshot -OutputFolder $Folder -StepNumber $Number -Label ($info.Action -replace '[^a-zA-Z0-9_-]', '_')
+    }
+
+    Add-AuditEntry -StepNumber $Number -Action $info.Action -Result 'Dry run (no change)' -Screenshot $shot `
         -Details "DRY RUN, no change made. Would execute: $($info.Cmdlets). $($info.Sim)"
 }
 
@@ -1356,7 +1485,7 @@ function Main {
         $operator = 'DRY RUN (no sign-in)'
         Add-AuditEntry -StepNumber 0 -Action 'Dry run started (no sign-in)' -Result 'Dry run (no change)' -Details "Target (sample): $upn. No connection was made."
         $toRun = if ($Steps) { $Steps } else { $allSteps }
-        foreach ($n in $toRun) { Invoke-DryRunStep -Number $n -Upn $upn }
+        foreach ($n in $toRun) { Invoke-DryRunStep -Number $n -Upn $upn -Folder $auditFolder }
     } else {
         Initialize-Modules
         $operator = Connect-Services
@@ -1425,8 +1554,10 @@ function Main {
     # Write the audit files (embedding the SharePoint link when known).
     $auditPath = Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl -DryRun $DryRun
     Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl -DryRun $DryRun | Out-Null
+    $htmlPath = Write-AuditHtml -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl -DryRun $DryRun
     Write-Ok "Wrote $auditPath"
     Write-Ok "Wrote $folderJson"
+    Write-Ok "Wrote $htmlPath"
     if ($JsonOutPath -and ($JsonOutPath -ne $folderJson)) {
         Copy-Item -Path $folderJson -Destination $JsonOutPath -Force
         Write-Ok "Copied audit.json to $JsonOutPath"
@@ -1447,6 +1578,7 @@ function Main {
             # Rewrite the local audit files so they do not falsely claim a SharePoint copy.
             Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -DryRun $DryRun | Out-Null
             Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState -DryRun $DryRun | Out-Null
+            Write-AuditHtml -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -DryRun $DryRun | Out-Null
             if ($JsonOutPath -and ($JsonOutPath -ne $folderJson)) { Copy-Item -Path $folderJson -Destination $JsonOutPath -Force }
         }
     }

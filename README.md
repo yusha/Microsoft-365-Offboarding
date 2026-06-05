@@ -14,8 +14,17 @@
 
 </div>
 
+<div align="center">
+
+[![Use at your own risk](https://img.shields.io/badge/%E2%9A%A0%20USE%20AT%20YOUR%20OWN%20RISK-NO%20WARRANTY%20%C2%B7%20NO%20LIABILITY-F4C20D?style=for-the-badge&labelColor=B8860B)](#-disclaimer)
+
+</div>
+
+> [!CAUTION]
+> **Legal disclaimer.** This tool performs powerful, **irreversible** administrative actions against a live Microsoft 365 tenant. It is provided free of charge, "as is" and "as available", with **no warranty of any kind**. **You use it entirely at your own risk and are solely responsible for any outcome.** To the maximum extent permitted by law, the author and contributors accept **no liability** and **cannot be held legally responsible** for any damage, data loss, lockout, or disruption arising from its use. Read the full [Disclaimer](#-disclaimer) before you run it.
+
 > [!NOTE]
-> Not affiliated with or endorsed by Microsoft. Provided under the MIT license with no warranty. Always test against a non-production account in your own tenant first, double-click **`demo.bat`** for a safe, no-sign-in walkthrough.
+> Not affiliated with or endorsed by Microsoft. Always test against a non-production account in your own tenant first, double-click **`demo.bat`** for a safe, no-sign-in walkthrough.
 
 ---
 
@@ -34,6 +43,7 @@
 - [REST API and MCP server](#-rest-api-and-mcp-server)
 - [Parameters](#-parameters)
 - [Requirements](#requirements)
+- [Disclaimer](#-disclaimer)
 - [Roadmap and contributing](#-roadmap-and-contributing)
 
 ---
@@ -211,11 +221,16 @@ jdoe_2026-06-05/
   ...
   step_10_conditional_access_applied_142740.png            (when screenshots are available)
   transcript.txt                                           (instead of screenshots on a headless host)
-  AUDIT.md
-  audit.json
+  AUDIT.md                                                 (human-readable)
+  audit.html                                               (beautiful self-contained report, double-click to view)
+  audit.json                                               (machine-readable)
 ```
 
-`AUDIT.md` has the identification table, a UTC timeline of every action and result, detailed per-step notes, and a final-state confirmation (account enabled, recipient type, license count, mobile device count). `audit.json` carries the same data in a structured form for programmatic consumption.
+Three views of the same record:
+
+- **`audit.html`** — a styled, self-contained HTML report with inline CSS and no external dependencies. Double-click it to view the whole packet offline in any browser: the identification and timeline (with colour-coded result badges), a screenshot gallery, the per-step notes, and the final state. Keep the folder together so the screenshots display.
+- **`AUDIT.md`** — the same content in Markdown: identification, a UTC timeline, per-step notes, and a final-state confirmation (account enabled, recipient type, license count, mobile device count).
+- **`audit.json`** — the same data in a structured form for programmatic consumption.
 
 ---
 
@@ -361,6 +376,24 @@ Routes: `GET /health`, `POST /preview`, `POST /rehire`, `POST /offboard`, `POST 
 </details>
 
 ---
+
+## ⚠️ Disclaimer
+
+<div align="center">
+
+[![Use at your own risk](https://img.shields.io/badge/%E2%9A%A0%20USE%20AT%20YOUR%20OWN%20RISK-NO%20WARRANTY%20%C2%B7%20NO%20LIABILITY-F4C20D?style=for-the-badge&labelColor=B8860B)](#-disclaimer)
+
+</div>
+
+**No warranty.** This software is provided free of charge, **"AS IS"** and **"AS AVAILABLE"**, without warranty of any kind, whether express, implied, or statutory, including but not limited to the implied warranties of merchantability, fitness for a particular purpose, title, and non-infringement. The author does not warrant that the software is error-free or secure, that it will operate without interruption, or that it will meet your requirements or produce any particular result.
+
+**Powerful, irreversible actions.** This tool performs administrative operations against a live Microsoft 365 tenant, including disabling accounts, revoking sessions, removing authentication methods, revoking app grants, removing licenses, converting mailboxes, and applying Conditional Access policies. **Some of these actions cannot be undone.** You are solely responsible for understanding what the tool does and for any and all consequences of running it.
+
+**Limitation of liability.** To the maximum extent permitted by applicable law, in no event shall the author or any contributor be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, including without limitation any direct, indirect, incidental, special, consequential, exemplary, or punitive damages, loss of data, loss of profits, business interruption, account lockout, or service disruption, arising from or in connection with the software or the use of (or inability to use) the software, even if advised of the possibility of such damages. **By downloading, running, or using this software you agree that you will not hold, and cannot legally hold, the author or contributors responsible or liable for any such outcome.**
+
+**Your responsibilities.** You are responsible for: obtaining proper authorization before offboarding any account; testing against a non-production account in your own tenant first (use `demo.bat` / `-DryRun`); maintaining adequate backups; and complying with all applicable laws, regulations, contractual obligations, and organizational policies. This software is **not legal, security, compliance, or other professional advice**, and using it does not guarantee compliance with any standard or regulation.
+
+**Acknowledgement.** By downloading, running, or otherwise using this software, you acknowledge that you have read, understood, and agree to this disclaimer and to the terms of the [MIT License](LICENSE).
 
 ## 🗺️ Roadmap and contributing
 

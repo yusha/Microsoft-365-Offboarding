@@ -390,7 +390,7 @@ function Write-RehireReport {
         historyMatches = @($HistoryMatches)
         tenantMatches  = @($TenantMatches)
     }
-    [System.IO.File]::WriteAllText($Path, ($obj | ConvertTo-Json -Depth 12), [System.Text.Encoding]::UTF8)
+    [System.IO.File]::WriteAllText($Path, ($obj | ConvertTo-Json -Depth 12), (New-Object System.Text.UTF8Encoding($false)))
     return $Path
 }
 
