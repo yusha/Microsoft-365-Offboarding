@@ -268,9 +268,18 @@ The SharePoint scan needs `Sites.Read.All`, which is requested only when `-Share
 
 Write the result for automation with `-JsonOutPath`. The offboarding tool also performs a lightweight version of this check automatically: if you offboard a user who already has an offboarding record in the chosen audit root, it warns you before proceeding.
 
+## REST API and MCP server
+
+The [`server/`](server) folder ships two dependency-free PowerShell servers on top of the `audit.json` contract:
+
+- `Start-RestApi.ps1` — a JSON REST API (`/preview`, `/rehire`, `/offboard`, `/reverse`, `/health`) with bearer-token auth.
+- `Start-McpServer.ps1` — a Model Context Protocol server (stdio) exposing `preview_offboarding`, `check_rehire`, `offboard_user`, and `reverse_offboarding` tools for AI clients such as Claude Desktop.
+
+Both read app-only credentials from the environment and keep the destructive actions disabled unless `M365_OFFBOARDING_ALLOW_EXECUTE=1`; `preview` and `rehire` are always available. See [server/README.md](server/README.md).
+
 ## Roadmap
 
-- A thin REST wrapper and an AI-agent tool manifest built on the existing `audit.json` contract (see [docs/INTEGRATION.md](docs/INTEGRATION.md)).
+The planned feature set is complete. Future ideas and contributions are welcome (see below).
 
 ## License
 

@@ -168,6 +168,15 @@ Executor responsibilities (keep these out of the model's control):
 
 A safe agent pattern is two tools: a read-only `preview_m365_offboarding` that runs the script with `-WhatIf` and returns the planned actions, and `offboard_m365_user` that performs them only after approval.
 
+## Ready-made REST API and MCP server
+
+You do not have to build the wrapper yourself. The [`server/`](../server) folder ships two dependency-free PowerShell servers built on the `audit.json` contract:
+
+- `Start-RestApi.ps1` — a JSON REST API (`HttpListener`) with `/preview`, `/rehire`, `/offboard`, `/reverse`, and `/health`, bearer-token auth, and the same execute gate.
+- `Start-McpServer.ps1` — a Model Context Protocol server over stdio exposing `preview_offboarding`, `check_rehire`, `offboard_user`, and `reverse_offboarding` tools, ready to drop into an MCP client such as Claude Desktop.
+
+Both read app-only credentials from the environment and keep destructive actions disabled unless `M365_OFFBOARDING_ALLOW_EXECUTE=1`. See [server/README.md](../server/README.md) for setup, the Claude Desktop config snippet, and the security model.
+
 ## Anthropic / Claude note
 
 If you build the agent on the Claude API, define `offboard_m365_user` as a tool and let the model request it; your code executes the script and returns `audit.json` as the `tool_result`. Keep the destructive call behind human approval, and consider exposing the `-WhatIf` preview as a separate read-only tool so the model can plan before acting. For current tool-use details, see the Anthropic documentation.
