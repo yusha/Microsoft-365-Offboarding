@@ -1,25 +1,119 @@
+<div align="center">
+
 # Microsoft 365 Offboarding
 
-A PowerShell tool that runs a complete, ordered Microsoft 365 user offboarding (decommissioning) against Microsoft Graph and Exchange Online, and produces an audit trail for every run.
+### A complete, ordered, audit-trailed Microsoft 365 user offboarding — in pure PowerShell.
 
-It performs the ten steps below in a deliberate order, preserves the mailbox as a shared mailbox (no email or calendar data is lost), and writes an audit packet: optional per-step screenshots, a human-readable `AUDIT.md` timeline, and a machine-readable `audit.json`.
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B%20%7C%207-5391FE.svg?logo=powershell&logoColor=white)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Cloud%20Shell-lightgrey.svg)](#-run-it-in-azure-cloud-shell)
+[![Release](https://img.shields.io/github/v/release/yusha/Microsoft-365-Offboarding?color=blue)](https://github.com/yusha/Microsoft-365-Offboarding/releases)
+[![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](#requirements)
 
-The tool runs interactively for a single admin at a keyboard, and unattended (app-only certificate auth, no prompts, JSON output) for automation: schedulers, AI agents, or a web portal. See [docs/INTEGRATION.md](docs/INTEGRATION.md).
+**One command (or one double-click)** locks an account, cleans up its access, preserves the mailbox as a shared mailbox, and writes a tamper-evident audit packet, with every step backed by Microsoft's own documentation.
 
-> Not affiliated with or endorsed by Microsoft. Provided under the MIT license with no warranty. Test against a non-production account in your own tenant before using it for real.
+</div>
 
-## Why a fixed procedure
+> [!NOTE]
+> Not affiliated with or endorsed by Microsoft. Provided under the MIT license with no warranty. Always test against a non-production account in your own tenant first, double-click **`demo.bat`** for a safe, no-sign-in walkthrough.
 
-Most offboarding mistakes are not single dramatic errors. They are small omissions and ordering problems that each look harmless:
+---
 
-- A mailbox is converted to shared *after* the license is removed, which Microsoft does not allow, so the conversion silently fails or is skipped.
-- A mobile device partnership is left in place, so a cached mail client keeps trying to refresh tokens for weeks and generates a stream of failed sign-in attempts.
-- OAuth app grants and authentication methods are never reviewed, so third-party app access and MFA registrations outlive the account.
-- No record is kept of what was done, so when someone asks "was this account actually secured?", answering it means a manual investigation instead of opening one file.
+## Contents
 
-A fixed, ordered procedure with a built-in audit trail removes all four problems. Every step below links to Microsoft's own documentation so you can verify the reasoning rather than take it on trust.
+- [Highlights](#-highlights)
+- [Quick start](#-quick-start)
+- [What's included](#-whats-included)
+- [The ten-step procedure](#-the-ten-step-procedure)
+- [Usage](#-usage)
+- [The audit packet](#-the-audit-packet)
+- [Store the packet in SharePoint](#-store-the-packet-in-sharepoint)
+- [Reverse an offboarding](#-reverse-an-offboarding)
+- [Rehire detection](#-rehire-detection)
+- [Run it in Azure Cloud Shell](#-run-it-in-azure-cloud-shell)
+- [REST API and MCP server](#-rest-api-and-mcp-server)
+- [Parameters](#-parameters)
+- [Requirements](#requirements)
+- [Roadmap and contributing](#-roadmap-and-contributing)
 
-## The ten steps
+---
+
+## ✨ Highlights
+
+| | |
+|---|---|
+| **Ordered 10-step procedure** | A fixed sequence that locks, cleans, and hardens, in the order Microsoft's docs require. |
+| **Mailbox preserved** | Converted to a shared mailbox before the license is removed, so no email or calendar data is lost. |
+| **Audit packet every run** | Per-step screenshots, a human-readable `AUDIT.md`, and a machine-readable `audit.json`. |
+| **Safe demo / training mode** | `demo.bat` and `-DryRun` walk every step with no sign-in and no changes. |
+| **Reversal companion** | Undo a mistaken offboarding and get a clear report of what cannot be restored. |
+| **Rehire detection** | Know before you re-hire: was this person offboarded before? Checks local, SharePoint, and live-tenant evidence. |
+| **Runs anywhere** | Windows, Linux, and the Azure Portal's Cloud Shell, interactive or fully unattended (app-only auth). |
+| **REST API and MCP server** | Drive it from a web portal, a scheduler, or an AI client such as Claude Desktop. |
+| **Zero dependencies** | Pure PowerShell. The required Microsoft modules install themselves on first run. |
+
+---
+
+## 🚀 Quick start
+
+**Just want to see what it does?** On Windows, double-click **`demo.bat`** (or run `.\Invoke-M365Offboarding.ps1 -DryRun`). It walks through all ten steps with **no sign-in, no modules, and no changes**, then writes a sample audit packet.
+
+**Offboard a user (interactive):**
+
+```powershell
+.\Invoke-M365Offboarding.ps1
+```
+
+You will be prompted for the user and audit folder, signed in through the browser (MFA supported), and shown a menu, choose `A` to run all ten steps.
+
+**Offboard a user end to end (no menu):**
+
+```powershell
+.\Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits -All
+```
+
+> [!TIP]
+> Add `-WhatIf` to any real run to preview every change against the live account without applying it.
+
+---
+
+## 📦 What's included
+
+| File | What it is |
+|---|---|
+| **`Invoke-M365Offboarding.ps1`** | The main tool: the 10-step offboarding, audit packet, dry-run mode, SharePoint upload. |
+| **`Invoke-M365OffboardingReversal.ps1`** | Companion that safely reverses an offboarding. |
+| **`Test-M365Rehire.ps1`** | Read-only rehire / prior-offboarding detection. |
+| **`demo.bat`** | Double-click to run a safe dry-run demo. |
+| **`Run-Offboarding.bat` / `Run-Reversal.bat` / `Run-RehireCheck.bat`** | Windows double-click launchers. |
+| **`server/Start-RestApi.ps1`** | A JSON REST API in front of the tools. |
+| **`server/Start-McpServer.ps1`** | A Model Context Protocol server for AI clients (Claude Desktop, etc.). |
+| **`docs/INTEGRATION.md`** | App-registration setup, the `audit.json` schema, and PHP / AI-agent examples. |
+| **`examples/`** | A working PHP wrapper and a sample `audit.json`. |
+
+---
+
+## 🔐 The ten-step procedure
+
+Most offboarding mistakes are not dramatic, they are small omissions and ordering problems: a mailbox converted to shared *after* the license is removed (which Microsoft does not allow), a mobile partnership left behind that retries auth for weeks, OAuth grants and MFA methods never reviewed, and no record of what was actually done. A fixed, ordered procedure with a built-in audit trail removes all four.
+
+| # | Phase | Step | Key cmdlet |
+|:-:|---|---|---|
+| 1 | **Immediate lockout** | Reset password and revoke all sign-in sessions | `Revoke-MgUserSignInSession` |
+| 2 | | Block sign-in (disable the account) | `Update-MgUser -AccountEnabled:$false` |
+| 3 | | Remove ActiveSync mobile device partnerships | `Remove-MobileDevice` |
+| 4 | **Authorization cleanup** | Remove registered authentication (MFA) methods | `Remove-MgUserAuthentication*Method` |
+| 5 | | Revoke OAuth app grants | `Remove-MgOauth2PermissionGrant` |
+| 6 | | Remove from groups and distribution lists | `Remove-MgGroupMemberByRef` |
+| 7 | **Mailbox transition & hardening** | Configure forwarding / delegation (optional) | `Set-Mailbox`, `Add-MailboxPermission` |
+| 8 | | Convert the user mailbox to a shared mailbox | `Set-Mailbox -Type Shared` |
+| 9 | | Remove Microsoft 365 licenses | `Set-MgUserLicense` |
+| 10 | | Apply a Conditional Access block on the user principal | `New-MgIdentityConditionalAccessPolicy` |
+
+**Why this order:** Phase 1 kills authentication first, so nothing can happen on the account while the rest runs. Step 8 must come before step 9 because Microsoft hides the "convert to shared" option once the license is removed. Step 10 is intentionally last and separate from disabling the account, so a policy-layer block survives an accidental re-enable.
+
+<details>
+<summary><strong>Full rationale and Microsoft documentation for each step</strong></summary>
 
 ### Phase 1: Immediate lockout
 
@@ -71,64 +165,29 @@ References: [Remove a former employee, Step 6](https://learn.microsoft.com/en-us
 Defense in depth. The user is added to a security group ("Offboarded Users" by default) that a Conditional Access policy blocks from all sign-ins. Even if the account is mistakenly re-enabled later, Conditional Access rejects every authentication. On first run the tool creates the group and the policy; the policy is created in report-only mode so a tenant admin reviews and enables it.
 Reference: [What is Conditional Access in Microsoft Entra ID](https://learn.microsoft.com/en-us/entra/identity/conditional-access/overview)
 
-## Why this order
+</details>
 
-Two rules drive the sequence:
+---
 
-1. **Lock the account before touching anything else.** Phase 1 kills authentication first, so nothing can happen on the account while the rest of the cleanup runs.
-2. **Convert the mailbox to shared before removing the license (step 8 before step 9).** Microsoft hides the conversion option once the license is gone. Doing these in the wrong order means either a failed conversion or having to re-add a license to fix it. The documentation quote in step 8 is the authority for this.
-
-Step 10 is intentionally last and intentionally separate from disabling the account, so there is a policy-layer block that survives an accidental re-enable.
-
-## Requirements
-
-- PowerShell 5.1 or later on Windows, or PowerShell 7 or later on any platform. The folder picker is Windows-only (a path prompt is used elsewhere). Screenshots are captured on Windows, and on a Linux desktop when a capture tool is available; on a headless host such as Azure Cloud Shell they are replaced by a `transcript.txt`. See "Running in Azure Cloud Shell" below.
-- The following modules, installed automatically on first run if missing:
-  `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Users.Actions`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Groups`, `ExchangeOnlineManagement`.
-- An account (interactive) or app registration (unattended) with these Microsoft Graph permissions, plus Exchange Online management rights:
-  `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`. The optional SharePoint upload also needs `Sites.ReadWrite.All`, which the tool requests only when an upload may occur (a site URL was supplied, or you run interactively without `-SkipSharePointUpload`). If you never use the upload, that scope is never requested.
-
-## Usage
+## 🖥️ Usage
 
 ### Interactive (single admin)
 
-On Windows, double-click `Run-Offboarding.bat`, or run:
-
-```powershell
-.\Invoke-M365Offboarding.ps1
-```
-
-It prompts for the target user, the audit folder, signs you in through the browser (full MFA supported), and shows a menu. Choose `A` to run all ten steps in order, or pick individual steps.
-
-Run a known user end to end without the menu:
-
-```powershell
-.\Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits -All
-```
-
-Preview without making changes (the script supports `-WhatIf`):
-
-```powershell
-.\Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits -All -WhatIf
-```
+Double-click `Run-Offboarding.bat`, or run `.\Invoke-M365Offboarding.ps1`. It prompts for the target user and audit folder, signs you in (MFA supported), and shows a menu.
 
 ### Training / dry-run mode
 
-To learn or demonstrate the tool with no risk, use `-DryRun`. It walks through all ten steps, narrates exactly what each one would do and which cmdlets it uses, and writes a clearly marked sample audit packet, but it never signs in, never touches the tenant, and makes no change. It needs no admin account and works offline on any platform (including Cloud Shell).
-
-On Windows, the quickest way to try it is to **double-click `demo.bat`**, which runs this dry run for you. Or from a shell:
+To learn or demonstrate the tool with **no risk**, double-click **`demo.bat`** or run `-DryRun`. It walks through all ten steps, narrates exactly what each one would do and which cmdlets it uses, and writes a clearly marked sample audit packet, but never signs in, never touches the tenant, and makes no change. It needs no admin account and works offline on any platform.
 
 ```powershell
 .\Invoke-M365Offboarding.ps1 -DryRun
 ```
 
-The sample packet's `audit.json` is tagged `"dryRun": true`, and `AUDIT.md` is headed as a training run. Dry-run records are ignored by the rehire check and the re-run guard, so practising never affects real detection.
-
-Difference from `-WhatIf`: `-WhatIf` makes a real connection and reads real data for a specific account but applies no changes; `-DryRun` is fully simulated with no sign-in or account required.
+The sample `audit.json` is tagged `"dryRun": true`, and `AUDIT.md` is headed as a training run. Dry-run records are ignored by the rehire check and the re-run guard, so practising never affects real detection. (Difference from `-WhatIf`: `-WhatIf` makes a real connection and reads real data for a specific account but applies no changes; `-DryRun` is fully simulated with no sign-in or account.)
 
 ### Unattended (automation)
 
-App-only certificate auth, no prompts, JSON output. Suitable for a scheduled task, an AI agent tool call, or a backend service:
+App-only certificate auth, no prompts, JSON output, suitable for a scheduled task, an AI agent tool call, or a backend service:
 
 ```powershell
 .\Invoke-M365Offboarding.ps1 -Unattended `
@@ -138,32 +197,11 @@ App-only certificate auth, no prompts, JSON output. Suitable for a scheduled tas
     -JsonOutPath C:\Audits\jdoe.json
 ```
 
-See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the app registration setup, the `audit.json` schema, and examples of calling the tool from PHP and from an AI agent.
+See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the app registration setup and the `audit.json` schema.
 
-### Running in Azure Cloud Shell
+---
 
-A Global Administrator can run the tool from the Azure Portal's Cloud Shell (the `>_` icon) instead of a local machine. Pick PowerShell, then:
-
-```powershell
-git clone https://github.com/yusha/Microsoft-365-Offboarding
-cd Microsoft-365-Offboarding
-./Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot ~/clouddrive/audits -All `
-    -SharePointSiteUrl https://contoso.sharepoint.com/sites/IT
-```
-
-Notes for Cloud Shell:
-
-- **Sign-in** uses device-code flow automatically (no browser pop-up): you get a code to enter at `microsoft.com/devicelogin`, which a Global Admin can consent to.
-- **Modules** install once with `Install-Module -Scope CurrentUser` and persist in your Cloud Shell profile.
-- **Screenshots are not captured.** Cloud Shell is a headless Linux environment with no graphical desktop, so there is no screen to capture and no component can change that. The tool detects this, says so, and instead records a text **`transcript.txt`** of the session alongside `AUDIT.md` and `audit.json`. If your audit policy requires images, take a screenshot of your own browser for the ticket, or run the tool on a Windows desktop. (Use `~/clouddrive` for persistence, or `-SharePointSiteUrl` so the packet leaves the session immediately.)
-
-On a **Linux machine with a real desktop** (an `X11` or Wayland session), screenshots *are* supported via `grim`, `scrot`, `gnome-screenshot`, or `import`. If none is installed, the tool offers to install one (with your confirmation) using the system package manager.
-
-### Azure Automation runbook
-
-For fully hands-off or scheduled offboarding, run the unattended mode from an Azure Automation PowerShell runbook with app-only certificate auth (no device-code prompt). Import the Microsoft Graph and Exchange Online modules into the Automation account, store the certificate, and call the script with `-Unattended -NoScreenshots` and the app-only parameters, writing the packet to SharePoint with `-SharePointSiteUrl`. The `audit.json` it returns is the record for each run.
-
-## The audit packet
+## 📁 The audit packet
 
 Each run produces a folder named `<user>_<yyyy-MM-dd>` containing:
 
@@ -179,17 +217,112 @@ jdoe_2026-06-05/
 
 `AUDIT.md` has the identification table, a UTC timeline of every action and result, detailed per-step notes, and a final-state confirmation (account enabled, recipient type, license count, mobile device count). `audit.json` carries the same data in a structured form for programmatic consumption.
 
-## Storing the audit packet in SharePoint
+---
 
-The audit packet is meant to live in SharePoint for later review. After the run completes, the tool can upload the whole folder (screenshots, `AUDIT.md`, `audit.json`) to a SharePoint document library for you.
+## ☁️ Store the packet in SharePoint
 
-- **Linked:** pass `-SharePointSiteUrl https://contoso.sharepoint.com/sites/IT` (and optionally `-SharePointFolderPath "Offboarding Audits"`). The tool resolves the site's default document library, creates the per-user subfolder, and uploads every file. The resulting SharePoint link is printed and recorded in both `AUDIT.md` and `audit.json`. A local copy is also kept.
-- **Interactive prompt:** if you do not pass a site URL, the tool asks whether to upload and, if you say yes, prompts for the site URL and folder.
-- **Not linked:** if you decline, pass `-SkipSharePointUpload`, or the upload fails, the packet stays local and the tool tells you exactly which folder to upload to SharePoint manually.
+The audit packet is meant to live in SharePoint for later review. After a run, the tool can upload the whole folder for you.
 
-Uploading uses the Microsoft Graph token already established at sign-in and needs the `Sites.ReadWrite.All` permission. That scope is requested at sign-in only when an upload may occur, so a run that never touches SharePoint never asks for it. If the permission is not consented, skip the upload and move the folder by hand. The offboarding itself never fails because of an upload problem; a failed upload only falls back to the manual-upload message.
+- **Linked:** pass `-SharePointSiteUrl https://contoso.sharepoint.com/sites/IT` (and optionally `-SharePointFolderPath "Offboarding Audits"`). The tool resolves the site's default document library, creates the per-user subfolder, uploads every file, and records the resulting link in `AUDIT.md` and `audit.json`. A local copy is kept too.
+- **Interactive prompt:** without a site URL, the tool asks whether to upload and prompts for the site and folder.
+- **Not linked:** if you decline, pass `-SkipSharePointUpload`, or the upload fails, the packet stays local and the tool tells you exactly which folder to upload by hand.
 
-## Parameters
+Uploading needs `Sites.ReadWrite.All`, requested only when an upload may actually occur. A failed upload never fails the offboarding, it just falls back to the manual-upload message.
+
+---
+
+## ↩️ Reverse an offboarding
+
+If an account was offboarded by mistake, use `Invoke-M365OffboardingReversal.ps1`. It restores the reversible parts in the correct order and clearly reports what cannot be put back.
+
+```powershell
+# Recover the original licenses from the offboarding record and reset the password:
+.\Invoke-M365OffboardingReversal.ps1 -UserPrincipalName jdoe@contoso.com `
+    -FromAuditJson C:\Audits\jdoe_2026-06-05\audit.json -ResetPassword
+
+# Or specify the license directly (or omit it to pick from a list):
+.\Invoke-M365OffboardingReversal.ps1 -UserPrincipalName jdoe@contoso.com -LicenseSkuPartNumber SPE_E3 -ResetPassword
+```
+
+**Restores, in order:** re-enable sign-in → remove from the "Offboarded Users" group (lifts the CA block) → re-assign a license → convert the shared mailbox back to a regular mailbox (after re-licensing, because a regular mailbox needs a license) → reset the password → clear forwarding → optionally remove added delegations.
+
+> [!WARNING]
+> **Cannot be restored automatically:** removed authentication (MFA) methods, removed mobile device partnerships, and revoked OAuth grants. The script reports these so the user can re-register MFA, re-add their mailbox on devices, and re-consent to apps.
+
+It runs interactively or unattended, supports `-WhatIf`, writes its own `REVERSAL_AUDIT.md` / `reversal-audit.json`, and needs `Organization.Read.All` in addition to the offboarding permissions (to read license SKUs).
+
+---
+
+## 🔁 Rehire detection
+
+Before onboarding a returning employee (or re-running an offboarding), check whether the person was offboarded before with `Test-M365Rehire.ps1`. It is **read-only**.
+
+```powershell
+.\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits
+.\Test-M365Rehire.ps1 -DisplayName "Jane Doe" -AuditRoot C:\Audits -SkipTenantCheck
+.\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -SharePointSiteUrl https://contoso.sharepoint.com/sites/IT
+```
+
+It draws on up to three sources and prints a verdict:
+
+- **Local audit history** — scans an audit root for past `audit.json` records (by UPN or display name).
+- **SharePoint audit history** — when `-SharePointSiteUrl` is given, scans the document library directly over Graph (no local sync). The durable place to keep packets when technicians' machines are disposable.
+- **Live tenant** — finds matching accounts and flags those that look offboarded (disabled, unlicensed, in the "Offboarded Users" group, or backed by a shared mailbox). This survives even when every local file and the script itself are deleted.
+
+| Verdict | Meaning |
+|---|---|
+| `RehireLikely` | A previously offboarded account still exists. Restore it with the reversal script instead of creating a new one. |
+| `PriorRecordOnly` | A past record exists but no matching account (it may have been deleted, restorable for 30 days). |
+| `AccountAlreadyExists` | A matching active account exists that does not look offboarded. |
+| `NoEvidence` | Nothing found; treat as a new hire. |
+
+The offboarding tool also runs a lightweight version of this automatically: it warns before offboarding a user who already has a record in the chosen audit root.
+
+---
+
+## ☁️ Run it in Azure Cloud Shell
+
+A Global Administrator can run the tool straight from the Azure Portal's Cloud Shell (the `>_` icon), no local machine needed. Pick **PowerShell**, then:
+
+```powershell
+git clone https://github.com/yusha/Microsoft-365-Offboarding
+cd Microsoft-365-Offboarding
+./Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot ~/clouddrive/audits -All `
+    -SharePointSiteUrl https://contoso.sharepoint.com/sites/IT
+```
+
+- **Sign-in** uses device-code flow (no browser pop-up): enter the code at `microsoft.com/devicelogin`.
+- **Modules** install once and persist in your Cloud Shell profile.
+- **Screenshots** are not possible (headless, no desktop); the tool says so and records a `transcript.txt` instead. Use `-SharePointSiteUrl` so the packet leaves the session immediately.
+
+On a **Linux desktop** (X11/Wayland) screenshots *are* supported via `grim`/`scrot`/`gnome-screenshot`/`import`, and the tool offers to install one if none is present. For fully hands-off runs, see the **Azure Automation runbook** note in [docs/INTEGRATION.md](docs/INTEGRATION.md).
+
+---
+
+## 🌐 REST API and MCP server
+
+The [`server/`](server) folder ships two dependency-free PowerShell servers built on the `audit.json` contract, so you can drive the tools from a web portal, a scheduler, or an AI client.
+
+**REST API** — `server/Start-RestApi.ps1` (System.Net.HttpListener):
+
+```bash
+curl -X POST http://127.0.0.1:8770/preview \
+  -H 'Authorization: Bearer <token>' -d '{"userPrincipalName":"jdoe@contoso.com"}'
+```
+
+Routes: `GET /health`, `POST /preview`, `POST /rehire`, `POST /offboard`, `POST /reverse`. Bearer-token auth on every route except `/health`.
+
+**MCP server** — `server/Start-McpServer.ps1` speaks Model Context Protocol over stdio, ready for **Claude Desktop** or another MCP client. Tools: `preview_offboarding`, `check_rehire`, `offboard_user`, `reverse_offboarding`.
+
+> [!IMPORTANT]
+> Both keep `preview` (dry-run) and `rehire` (read-only) always available, while the destructive `offboard` and `reverse` are **disabled unless** the operator sets `M365_OFFBOARDING_ALLOW_EXECUTE=1` and provides app-only credentials. Credentials never come from callers. See [server/README.md](server/README.md) for setup, the Claude Desktop config, and the full security model.
+
+---
+
+## ⚙️ Parameters
+
+<details>
+<summary><strong>Offboarding tool parameters</strong></summary>
 
 | Parameter | Purpose |
 |---|---|
@@ -212,81 +345,27 @@ Uploading uses the Microsoft Graph token already established at sign-in and need
 | `-SkipSharePointUpload` | Never upload and never prompt; keep the packet local. |
 | `-WhatIf` | Preview every change without applying it. |
 
-## Reversing an offboarding
+</details>
 
-If an account was offboarded by mistake, use the companion script `Invoke-M365OffboardingReversal.ps1`. It restores the reversible parts in the correct order (re-enable, lift the Conditional Access block, re-license, convert the mailbox back) and clearly reports what cannot be put back.
+---
 
-Recover the original licenses straight from the offboarding record and reset the password:
+## Requirements
 
-```powershell
-.\Invoke-M365OffboardingReversal.ps1 -UserPrincipalName jdoe@contoso.com `
-    -FromAuditJson C:\Audits\jdoe_2026-06-05\audit.json -ResetPassword
-```
+<details>
+<summary><strong>PowerShell, modules, and permissions</strong></summary>
 
-Or specify the license directly (by SKU part number or GUID), or run with no license argument to pick from a list interactively:
+- **PowerShell** 5.1+ on Windows, or 7+ on any platform. The folder picker is Windows-only (a path prompt is used elsewhere). Screenshots are captured on Windows and on a Linux desktop with a capture tool; on a headless host such as Cloud Shell they are replaced by a `transcript.txt`.
+- **Modules** (installed automatically on first run if missing): `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Users.Actions`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Groups`, `ExchangeOnlineManagement`.
+- **Permissions** (an admin account interactively, or an app registration unattended), plus Exchange Online management rights: `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`. The optional SharePoint upload also needs `Sites.ReadWrite.All`, requested only when an upload may occur. The reversal script additionally needs `Organization.Read.All`.
 
-```powershell
-.\Invoke-M365OffboardingReversal.ps1 -UserPrincipalName jdoe@contoso.com -LicenseSkuPartNumber SPE_E3 -ResetPassword
-```
+</details>
 
-What it restores, in order:
+---
 
-1. Re-enable sign-in (`AccountEnabled = true`)
-2. Remove the user from the "Offboarded Users" group (lifts the Conditional Access block)
-3. Re-assign a Microsoft 365 license
-4. Convert the shared mailbox back to a regular user mailbox (a regular mailbox needs a license, so this runs after re-licensing)
-5. Reset the password (`-ResetPassword`) so the user can sign in again
-6. Clear forwarding the offboarding set (use `-KeepForwarding` to leave it)
-7. Optionally remove added Full Access / Send As delegations (`-RemoveDelegation`)
+## 🗺️ Roadmap and contributing
 
-It runs interactively or unattended (app-only auth), supports `-WhatIf`, and writes its own reversal record (`REVERSAL_AUDIT.md` and `reversal-audit.json`). It needs the same kind of permissions as the offboarding tool, plus `Organization.Read.All` to read the tenant's license SKUs.
-
-**Cannot be restored automatically:** removed authentication (MFA) methods, removed mobile device (ActiveSync) partnerships, and revoked OAuth grants. The script reports these so you can have the user re-register MFA, re-add their mailbox on devices, and re-consent to apps.
-
-## Rehire detection
-
-Before onboarding a returning employee (or re-running an offboarding), check whether the person was offboarded before with `Test-M365Rehire.ps1`. It is read-only and makes no changes.
-
-```powershell
-.\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits
-.\Test-M365Rehire.ps1 -DisplayName "Jane Doe" -AuditRoot C:\Audits -SkipTenantCheck
-.\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -SharePointSiteUrl https://contoso.sharepoint.com/sites/IT -SharePointFolderPath "Offboarding Audits"
-```
-
-It looks for evidence from up to three sources and prints a verdict:
-
-- **Local audit history** — scans an audit root (`-AuditRoot`) for past `audit.json` records and matches by UPN or display name.
-- **SharePoint audit history** — when `-SharePointSiteUrl` is supplied, scans that site's document library directly over Microsoft Graph, so audit packets that live in SharePoint are found without a local sync. (`-SharePointFolderPath` narrows it to one folder.) This is the durable place to keep audit packets when technicians' machines are disposable. The scan is only performed when a site URL is given.
-- **Live tenant** — finds matching accounts and flags those that look offboarded (disabled, unlicensed, in the "Offboarded Users" group, or backed by a shared mailbox). This source survives even when every local file and the script itself are deleted, because the disabled/unlicensed account and shared mailbox remain in the tenant. Use `-SkipTenantCheck` for a history-only check with no account lookup.
-
-The SharePoint scan needs `Sites.Read.All`, which is requested only when `-SharePointSiteUrl` is supplied.
-
-| Verdict | Meaning |
-|---|---|
-| `RehireLikely` | A previously offboarded account still exists. Restore it with `Invoke-M365OffboardingReversal.ps1` instead of creating a new one. |
-| `PriorRecordOnly` | A past offboarding record exists but no matching account. The account may have been deleted (restorable for 30 days). |
-| `AccountAlreadyExists` | A matching active account exists that does not look offboarded. |
-| `NoEvidence` | Nothing found; treat as a new hire. |
-
-Write the result for automation with `-JsonOutPath`. The offboarding tool also performs a lightweight version of this check automatically: if you offboard a user who already has an offboarding record in the chosen audit root, it warns you before proceeding.
-
-## REST API and MCP server
-
-The [`server/`](server) folder ships two dependency-free PowerShell servers on top of the `audit.json` contract:
-
-- `Start-RestApi.ps1` — a JSON REST API (`/preview`, `/rehire`, `/offboard`, `/reverse`, `/health`) with bearer-token auth.
-- `Start-McpServer.ps1` — a Model Context Protocol server (stdio) exposing `preview_offboarding`, `check_rehire`, `offboard_user`, and `reverse_offboarding` tools for AI clients such as Claude Desktop.
-
-Both read app-only credentials from the environment and keep the destructive actions disabled unless `M365_OFFBOARDING_ALLOW_EXECUTE=1`; `preview` and `rehire` are always available. See [server/README.md](server/README.md).
-
-## Roadmap
-
-The planned feature set is complete. Future ideas and contributions are welcome (see below).
+The planned feature set is complete. Issues and pull requests are welcome, useful contributions include support for additional authentication-method types as Microsoft Graph adds them, packaging as a PowerShell module, and a CI workflow.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
-
-## Contributing
-
-Issues and pull requests are welcome. Useful contributions: support for additional authentication method types as Microsoft Graph adds them, packaging as a PowerShell module, and the roadmap items above.
+[MIT](LICENSE). Copyright (c) 2026 Yusha.
