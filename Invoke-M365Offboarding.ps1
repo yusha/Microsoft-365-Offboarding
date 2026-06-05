@@ -101,6 +101,21 @@
     Optional explicit path for the machine-readable audit.json. Defaults to
     audit.json inside the audit folder.
 
+.PARAMETER SharePointSiteUrl
+    SharePoint site URL to upload the finished audit packet to, for example
+    https://contoso.sharepoint.com/sites/IT. When supplied, the audit folder is
+    uploaded to that site's default document library after the run. When omitted
+    in interactive mode you are asked whether to link a site; if you decline, the
+    packet stays local and you are reminded to upload it manually.
+
+.PARAMETER SharePointFolderPath
+    Destination folder inside the site's document library, for example
+    "Offboarding Audits". The per-user audit subfolder is created beneath it.
+    Defaults to the library root.
+
+.PARAMETER SkipSharePointUpload
+    Do not upload to SharePoint and do not prompt. The packet stays local.
+
 .EXAMPLE
     .\Invoke-M365Offboarding.ps1
     Interactive: prompts for everything, browser sign-in, menu driven.
@@ -143,7 +158,10 @@ param(
     [string]$ClientId,
     [string]$CertificateThumbprint,
     [string]$Organization,
-    [string]$JsonOutPath
+    [string]$JsonOutPath,
+    [string]$SharePointSiteUrl,
+    [string]$SharePointFolderPath,
+    [switch]$SkipSharePointUpload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -269,7 +287,8 @@ function Connect-Services {
         'Group.ReadWrite.All',
         'GroupMember.ReadWrite.All',
         'DelegatedPermissionGrant.ReadWrite.All',
-        'UserAuthenticationMethod.ReadWrite.All'
+        'UserAuthenticationMethod.ReadWrite.All',
+        'Sites.ReadWrite.All'
     )
 
     $appOnly = $ClientId -and $CertificateThumbprint -and $TenantId
@@ -353,7 +372,7 @@ function Add-AuditEntry {
 }
 
 function Write-AuditMarkdown {
-    param([string]$OutputFolder, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState)
+    param([string]$OutputFolder, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl)
 
     $startTime = $script:AuditLog | Select-Object -First 1 -ExpandProperty Timestamp
     $endTime   = $script:AuditLog | Select-Object -Last 1 -ExpandProperty Timestamp
@@ -370,6 +389,7 @@ function Write-AuditMarkdown {
     [void]$sb.AppendLine("| Started (UTC) | $startTime |")
     [void]$sb.AppendLine("| Completed (UTC) | $endTime |")
     [void]$sb.AppendLine("| Performed by | $Operator |")
+    if ($SharePointUrl) { [void]$sb.AppendLine("| Stored in SharePoint | $SharePointUrl |") }
     [void]$sb.AppendLine('')
 
     [void]$sb.AppendLine('## Timeline')
@@ -413,7 +433,7 @@ function Write-AuditMarkdown {
 }
 
 function Write-AuditJson {
-    param([string]$Path, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState)
+    param([string]$Path, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState, [string]$SharePointUrl)
 
     $obj = [ordered]@{
         tool            = 'Invoke-M365Offboarding'
@@ -434,6 +454,7 @@ function Write-AuditJson {
             }
         })
         finalState      = $FinalState
+        sharePointUrl   = $SharePointUrl
         success         = (-not ($script:AuditLog | Where-Object { $_.Result -like 'FAILED*' }))
     }
     $json = $obj | ConvertTo-Json -Depth 12
@@ -455,7 +476,10 @@ function Invoke-Step1 {
 
     if ($PSCmdlet.ShouldProcess($Upn, 'Reset password and revoke sessions')) {
         $bytes = New-Object 'byte[]' 18
-        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+        try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+        # Append a fixed complexity suffix so the value always satisfies Entra
+        # password policy (upper, lower, digit, symbol) regardless of the random bytes.
         $newPwd = [Convert]::ToBase64String($bytes) + '!Aa9'
         $body = @{ passwordProfile = @{ forceChangePasswordNextSignIn = $true; password = $newPwd } }
 
@@ -586,6 +610,7 @@ function Invoke-Step5 {
     $details = "OAuth2 grants found: $grantCount`n"
     foreach ($g in $grants) { $details += "  - GrantId=$($g.Id), ClientId=$($g.ClientId), Scope=$($g.Scope)`n" }
 
+    $failures = 0
     foreach ($g in $grants) {
         if (-not $PSCmdlet.ShouldProcess($g.Id, 'Revoke OAuth2 grant')) { continue }
         try {
@@ -593,13 +618,15 @@ function Invoke-Step5 {
             Write-Ok "Revoked grant $($g.Id)"
             $details += "Revoked grant $($g.Id).`n"
         } catch {
+            $failures++
             Write-WarnMsg "Could not revoke $($g.Id): $_"
             $details += "Failed to revoke grant $($g.Id): $_`n"
         }
     }
 
+    $result = if ($failures -gt 0) { "Completed with $failures failure(s)" } else { 'Success' }
     $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 5 -Label 'oauth_grants_revoked'
-    Add-AuditEntry -StepNumber 5 -Action "Revoked $grantCount OAuth2 grant(s)" -Result 'Success' -Screenshot $shot -Details $details
+    Add-AuditEntry -StepNumber 5 -Action "Revoked $grantCount OAuth2 grant(s)" -Result $result -Screenshot $shot -Details $details
 }
 
 # ---------- Step 6: Remove from groups ----------
@@ -625,6 +652,7 @@ function Invoke-Step6 {
     Write-Info "Found $($editableGroups.Count) cloud-managed group(s)."
     $details = "Group memberships: $($groups.Count) total, $($editableGroups.Count) cloud-managed.`n"
 
+    $failures = 0
     foreach ($g in $editableGroups) {
         if (-not $PSCmdlet.ShouldProcess($g.DisplayName, 'Remove group membership')) { continue }
         try {
@@ -632,13 +660,15 @@ function Invoke-Step6 {
             Write-Ok "Removed from: $($g.DisplayName)"
             $details += "  Removed from: $($g.DisplayName) ($($g.Id))`n"
         } catch {
+            $failures++
             Write-WarnMsg "Could not remove from '$($g.DisplayName)': $_"
             $details += "  Failed: $($g.DisplayName) - $_`n"
         }
     }
 
+    $result = if ($failures -gt 0) { "Completed with $failures failure(s)" } else { 'Success' }
     $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 6 -Label 'groups_removed'
-    Add-AuditEntry -StepNumber 6 -Action "Removed user from $($editableGroups.Count) cloud-managed group(s)" -Result 'Success' -Screenshot $shot -Details $details
+    Add-AuditEntry -StepNumber 6 -Action "Removed user from $($editableGroups.Count) cloud-managed group(s)" -Result $result -Screenshot $shot -Details $details
 }
 
 # ---------- Step 7: Forwarding / delegation (optional) ----------
@@ -753,8 +783,10 @@ function Invoke-Step10 {
     Write-Info 'Defense in depth: even if the account is mistakenly re-enabled,'
     Write-Info 'Conditional Access rejects every sign-in for members of the group.'
 
+    # Escape single quotes for the OData filter (a name like O'Brien would break it).
+    $groupNameFilter = $OffboardedGroupName -replace "'", "''"
     Write-Action "Looking for security group '$OffboardedGroupName'..."
-    $group = Get-MgGroup -Filter "displayName eq '$OffboardedGroupName'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $group = Get-MgGroup -Filter "displayName eq '$groupNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $group) {
         Write-WarnMsg "Group not found. Creating '$OffboardedGroupName'..."
         $nickname = ($OffboardedGroupName -replace '[^a-zA-Z0-9]', '').ToLower()
@@ -778,8 +810,9 @@ function Invoke-Step10 {
         else { throw }
     }
 
+    $policyNameFilter = $BlockPolicyName -replace "'", "''"
     Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
-    $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$BlockPolicyName'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $policy) {
         Write-WarnMsg "Policy not found. Creating in REPORT-ONLY mode. An admin must enable it."
         $policyBody = @{
@@ -835,31 +868,97 @@ function Get-FinalState {
 }
 
 # ================================================================
+# SECTION 7b: SharePoint upload (optional)
+# ================================================================
+# Uploads the finished audit folder to a SharePoint document library using the
+# Microsoft Graph token already established by Connect-MgGraph (no extra module).
+# Requires the Sites.ReadWrite.All scope / application permission.
+
+function ConvertTo-DrivePath {
+    # URL-encode each path segment for a Graph drive path address.
+    param([string]$Path)
+    ($Path.Trim('/').Split('/') | Where-Object { $_ } | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+}
+
+function Resolve-SharePointTarget {
+    # Resolves the site and default document library, ensures the destination
+    # folder tree exists, and returns the drive id, destination path, and webUrl.
+    param([string]$SiteUrl, [string]$FolderPath, [string]$LeafName)
+
+    $uri = [Uri]$SiteUrl
+    $siteHost = $uri.Host
+    $rel = $uri.AbsolutePath.TrimEnd('/')
+    $siteAddr = if ([string]::IsNullOrWhiteSpace($rel) -or $rel -eq '/') { $siteHost } else { "$siteHost`:$rel" }
+
+    Write-Action "Resolving SharePoint site '$SiteUrl'..."
+    $site = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$siteAddr" -OutputType PSObject
+    if (-not $site.id) { throw "Could not resolve SharePoint site '$SiteUrl'. Check the URL." }
+
+    $drive = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/drive" -OutputType PSObject
+    $driveId = $drive.id
+
+    $destFolder = if ([string]::IsNullOrWhiteSpace($FolderPath)) { $LeafName } else { ($FolderPath.Trim('/') + '/' + $LeafName) }
+
+    # Create each folder segment if missing (ignore "already exists").
+    $segments = $destFolder.Split('/') | Where-Object { $_ }
+    $parent = ''
+    foreach ($seg in $segments) {
+        $childrenUri = if ($parent) {
+            "https://graph.microsoft.com/v1.0/drives/$driveId/root:/$(ConvertTo-DrivePath $parent):/children"
+        } else {
+            "https://graph.microsoft.com/v1.0/drives/$driveId/root/children"
+        }
+        $body = @{ name = $seg; folder = @{}; '@microsoft.graph.conflictBehavior' = 'fail' }
+        try {
+            Invoke-MgGraphRequest -Method POST -Uri $childrenUri -Body ($body | ConvertTo-Json) -ContentType 'application/json' | Out-Null
+        } catch {
+            $exists = "$_" -match 'nameAlreadyExists|already exists'
+            if (-not $exists -and $_.Exception.Response.StatusCode.value__ -ne 409) { throw }
+        }
+        $parent = if ($parent) { "$parent/$seg" } else { $seg }
+    }
+
+    $folderItem = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/drives/$driveId/root:/$(ConvertTo-DrivePath $destFolder)" -OutputType PSObject
+    return @{ DriveId = $driveId; DestFolder = $destFolder; WebUrl = $folderItem.webUrl }
+}
+
+function Send-FilesToSharePoint {
+    # Simple upload (single PUT, supports files up to 250 MB) for each file.
+    # -InputFilePath streams the file as the raw request body.
+    param([string]$DriveId, [string]$DestFolder, $Files)
+    foreach ($f in $Files) {
+        $enc = ConvertTo-DrivePath "$DestFolder/$($f.Name)"
+        $uploadUri = "https://graph.microsoft.com/v1.0/drives/$DriveId/root:/$enc`:/content"
+        Invoke-MgGraphRequest -Method PUT -Uri $uploadUri -InputFilePath $f.FullName -ContentType 'application/octet-stream' | Out-Null
+        Write-Ok "Uploaded $($f.Name)"
+    }
+}
+
+# ================================================================
 # SECTION 8: Orchestration
 # ================================================================
-$script:StepMap = $null
-
-function Initialize-StepMap {
-    param([string]$Upn, [string]$Folder)
-    $script:StepMap = @{
-        1  = { Invoke-Step1  -Upn $Upn -Folder $Folder }
-        2  = { Invoke-Step2  -Upn $Upn -Folder $Folder }
-        3  = { Invoke-Step3  -Upn $Upn -Folder $Folder }
-        4  = { Invoke-Step4  -Upn $Upn -Folder $Folder }
-        5  = { Invoke-Step5  -Upn $Upn -Folder $Folder }
-        6  = { Invoke-Step6  -Upn $Upn -Folder $Folder }
-        7  = { Invoke-Step7  -Upn $Upn -Folder $Folder }
-        8  = { Invoke-Step8  -Upn $Upn -Folder $Folder }
-        9  = { Invoke-Step9  -Upn $Upn -Folder $Folder }
-        10 = { Invoke-Step10 -Upn $Upn -Folder $Folder }
+function Invoke-StepByNumber {
+    param([int]$Number, [string]$Upn, [string]$Folder)
+    switch ($Number) {
+        1  { Invoke-Step1  -Upn $Upn -Folder $Folder }
+        2  { Invoke-Step2  -Upn $Upn -Folder $Folder }
+        3  { Invoke-Step3  -Upn $Upn -Folder $Folder }
+        4  { Invoke-Step4  -Upn $Upn -Folder $Folder }
+        5  { Invoke-Step5  -Upn $Upn -Folder $Folder }
+        6  { Invoke-Step6  -Upn $Upn -Folder $Folder }
+        7  { Invoke-Step7  -Upn $Upn -Folder $Folder }
+        8  { Invoke-Step8  -Upn $Upn -Folder $Folder }
+        9  { Invoke-Step9  -Upn $Upn -Folder $Folder }
+        10 { Invoke-Step10 -Upn $Upn -Folder $Folder }
+        default { Write-WarnMsg "Unknown step number: $Number" }
     }
 }
 
 function Invoke-StepList {
-    param([int[]]$Numbers, [bool]$StopOnError)
+    param([int[]]$Numbers, [string]$Upn, [string]$Folder, [bool]$StopOnError)
     foreach ($n in $Numbers) {
         try {
-            & $script:StepMap[$n]
+            Invoke-StepByNumber -Number $n -Upn $Upn -Folder $Folder
         } catch {
             Write-ErrMsg "Step $n failed: $_"
             Add-AuditEntry -StepNumber $n -Action "Step $n" -Result "FAILED: $_" -Details "Exception: $($_.Exception.Message)"
@@ -952,23 +1051,18 @@ function Main {
     Add-AuditEntry -StepNumber 0 -Action 'Connected to Microsoft Graph and Exchange Online' -Result "Authenticated as $operator" `
         -Details "Target: $upn."
 
-    Initialize-StepMap -Upn $upn -Folder $auditFolder
-
     # Decide which steps to run
     $allSteps = 1..10
-    if ($Unattended) {
+    if ($Unattended -or $All -or $Steps) {
         $toRun = if ($Steps) { $Steps } else { $allSteps }
-        Invoke-StepList -Numbers $toRun -StopOnError:$false
-    } elseif ($All -or $Steps) {
-        $toRun = if ($Steps) { $Steps } else { $allSteps }
-        Invoke-StepList -Numbers $toRun -StopOnError:$false
+        Invoke-StepList -Numbers $toRun -Upn $upn -Folder $auditFolder -StopOnError:$false
     } else {
         while ($true) {
             $choice = (Show-StepMenu -Upn $upn).ToUpper().Trim()
             if ($choice -eq 'Q') { break }
-            if ($choice -eq 'A') { Invoke-StepList -Numbers $allSteps -StopOnError:$false; break }
+            if ($choice -eq 'A') { Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false; break }
             if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le 10) {
-                Invoke-StepList -Numbers @([int]$choice) -StopOnError:$false
+                Invoke-StepList -Numbers @([int]$choice) -Upn $upn -Folder $auditFolder -StopOnError:$false
             } else {
                 Write-WarnMsg 'Invalid choice. Use 1-10, A, or Q.'
             }
@@ -978,15 +1072,80 @@ function Main {
     # Audit packet
     Write-Banner 'GENERATING AUDIT PACKET'
     $finalState = Get-FinalState -Upn $upn
-    $auditPath = Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState
-    Write-Ok "Wrote $auditPath"
+    $folderJson = Join-Path $auditFolder 'audit.json'
 
-    $jsonPath = if ($JsonOutPath) { $JsonOutPath } else { Join-Path $auditFolder 'audit.json' }
-    Write-AuditJson -Path $jsonPath -TargetUpn $upn -Operator $operator -FinalState $finalState | Out-Null
-    Write-Ok "Wrote $jsonPath"
+    # Decide whether and where to upload to SharePoint.
+    $spSite = $SharePointSiteUrl
+    $spFolder = $SharePointFolderPath
+    $doUpload = $false
+    if (-not $SkipSharePointUpload) {
+        if ($spSite) {
+            $doUpload = $true
+        } elseif (-not $Unattended) {
+            Write-Banner 'SHAREPOINT UPLOAD'
+            Write-Info 'The audit packet should be stored in SharePoint for later review.'
+            $ans = Read-Host '  Upload it to SharePoint now? (Y/n)'
+            if ($ans -notmatch '^[Nn]') {
+                $spSite = Read-Host '  SharePoint site URL (e.g. https://contoso.sharepoint.com/sites/IT)'
+                if (-not [string]::IsNullOrWhiteSpace($spSite)) {
+                    $spFolder = Read-Host '  Folder in the document library (ENTER for root, e.g. Offboarding Audits)'
+                    $doUpload = $true
+                } else {
+                    Write-WarnMsg 'No site URL entered. The packet will stay local.'
+                }
+            }
+        }
+    }
+
+    # Resolve the SharePoint destination first so the audit files can record the link.
+    $spUrl = $null
+    $spTarget = $null
+    if ($doUpload) {
+        try {
+            $spTarget = Resolve-SharePointTarget -SiteUrl $spSite -FolderPath $spFolder -LeafName (Split-Path $auditFolder -Leaf)
+            $spUrl = $spTarget.WebUrl
+        } catch {
+            Write-WarnMsg "Could not prepare the SharePoint destination: $_"
+            $doUpload = $false
+        }
+    }
+
+    # Write the audit files (embedding the SharePoint link when known).
+    $auditPath = Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl
+    Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState -SharePointUrl $spUrl | Out-Null
+    Write-Ok "Wrote $auditPath"
+    Write-Ok "Wrote $folderJson"
+    if ($JsonOutPath -and ($JsonOutPath -ne $folderJson)) {
+        Copy-Item -Path $folderJson -Destination $JsonOutPath -Force
+        Write-Ok "Copied audit.json to $JsonOutPath"
+    }
+
+    # Upload the whole folder to SharePoint.
+    if ($doUpload) {
+        Write-Action 'Uploading audit packet to SharePoint...'
+        try {
+            Send-FilesToSharePoint -DriveId $spTarget.DriveId -DestFolder $spTarget.DestFolder -Files (Get-ChildItem -File -Path $auditFolder)
+            Write-Ok "Audit packet uploaded to SharePoint: $spUrl"
+        } catch {
+            Write-WarnMsg "SharePoint upload failed: $_"
+            $spUrl = $null
+            # Rewrite the local audit files so they do not falsely claim a SharePoint copy.
+            Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState | Out-Null
+            Write-AuditJson -Path $folderJson -TargetUpn $upn -Operator $operator -FinalState $finalState | Out-Null
+            if ($JsonOutPath -and ($JsonOutPath -ne $folderJson)) { Copy-Item -Path $folderJson -Destination $JsonOutPath -Force }
+        }
+    }
+
+    if (-not $spUrl) {
+        Write-Banner 'UPLOAD TO SHAREPOINT' 'Yellow'
+        Write-Info 'The audit packet was not uploaded to SharePoint.'
+        Write-Info 'Please upload this folder to SharePoint for later review:'
+        Write-Host "    $auditFolder" -ForegroundColor Yellow
+    }
 
     Write-Banner 'COMPLETE' 'Green'
     Write-Host "  Audit folder: $auditFolder" -ForegroundColor Green
+    if ($spUrl) { Write-Host "  SharePoint:   $spUrl" -ForegroundColor Green }
 
     if (-not $Unattended -and $script:IsWindowsHost) {
         try { Start-Process explorer.exe $auditFolder } catch { }

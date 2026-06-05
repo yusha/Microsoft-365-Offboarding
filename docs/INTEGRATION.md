@@ -18,7 +18,7 @@ That means any language that can launch a process and read a file can integrate 
 
 1. In the Entra admin center, create an app registration.
 2. Add these **application** Microsoft Graph permissions and grant admin consent:
-   `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`.
+   `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`. Add `Sites.ReadWrite.All` only if you use the SharePoint upload (it grants access to all sites; for least privilege, use `Sites.Selected` and grant the app access to just the target site instead).
 3. For Exchange Online app-only access, register the app for Exchange management and assign it a role that can run the mailbox cmdlets (for example Exchange Recipient Administrator). See [App-only authentication for Exchange Online PowerShell](https://learn.microsoft.com/en-us/powershell/exchange/app-only-auth-powershell-v2).
 4. Create or upload a certificate to the app registration, and install the matching certificate (with private key) on the machine that will run the script. Pass its thumbprint with `-CertificateThumbprint`.
 
@@ -64,6 +64,7 @@ Exit code `0` means no step reported a failure. A non-zero exit code means at le
     "Recipient type details": "SharedMailbox",
     "Mobile device partnerships": 0
   },
+  "sharePointUrl": "https://contoso.sharepoint.com/sites/IT/Shared%20Documents/Offboarding%20Audits/jdoe_2026-06-05",
   "success": true
 }
 ```
@@ -74,6 +75,7 @@ Field notes:
 - Each `steps[].result` is one of `Success`, `Skipped`, `Completed with N failure(s)`, or `FAILED: <message>`.
 - `step` `0` is the connection event, not one of the ten actions.
 - `screenshot` is a filename relative to the audit folder, or `null` when screenshots were disabled.
+- `sharePointUrl` is the uploaded folder's link, or `null` if SharePoint upload was not used or did not succeed. To upload from automation, pass `-SharePointSiteUrl` (and optionally `-SharePointFolderPath`).
 
 Treat `audit.json` as the integration surface. The console output and `AUDIT.md` are for humans; the JSON is the stable contract.
 

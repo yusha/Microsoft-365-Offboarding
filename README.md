@@ -86,7 +86,7 @@ Step 10 is intentionally last and intentionally separate from disabling the acco
 - The following modules, installed automatically on first run if missing:
   `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Users.Actions`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Groups`, `ExchangeOnlineManagement`.
 - An account (interactive) or app registration (unattended) with these Microsoft Graph permissions, plus Exchange Online management rights:
-  `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`.
+  `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`, and `Sites.ReadWrite.All` (only needed for the optional SharePoint upload).
 
 ## Usage
 
@@ -141,6 +141,16 @@ jdoe_2026-06-05/
 
 `AUDIT.md` has the identification table, a UTC timeline of every action and result, detailed per-step notes, and a final-state confirmation (account enabled, recipient type, license count, mobile device count). `audit.json` carries the same data in a structured form for programmatic consumption.
 
+## Storing the audit packet in SharePoint
+
+The audit packet is meant to live in SharePoint for later review. After the run completes, the tool can upload the whole folder (screenshots, `AUDIT.md`, `audit.json`) to a SharePoint document library for you.
+
+- **Linked:** pass `-SharePointSiteUrl https://contoso.sharepoint.com/sites/IT` (and optionally `-SharePointFolderPath "Offboarding Audits"`). The tool resolves the site's default document library, creates the per-user subfolder, and uploads every file. The resulting SharePoint link is printed and recorded in both `AUDIT.md` and `audit.json`. A local copy is also kept.
+- **Interactive prompt:** if you do not pass a site URL, the tool asks whether to upload and, if you say yes, prompts for the site URL and folder.
+- **Not linked:** if you decline, pass `-SkipSharePointUpload`, or the upload fails, the packet stays local and the tool tells you exactly which folder to upload to SharePoint manually.
+
+Uploading uses the Microsoft Graph token already established at sign-in and needs the `Sites.ReadWrite.All` permission. If that permission is not consented, skip the upload and move the folder by hand. The offboarding itself never fails because of an upload problem; a failed upload only falls back to the manual-upload message.
+
 ## Parameters
 
 | Parameter | Purpose |
@@ -158,6 +168,9 @@ jdoe_2026-06-05/
 | `-BlockPolicyName` | Conditional Access policy name. |
 | `-TenantId` / `-ClientId` / `-CertificateThumbprint` / `-Organization` | App-only auth for unattended runs. |
 | `-JsonOutPath` | Explicit path for `audit.json`. |
+| `-SharePointSiteUrl` | Upload the finished packet to this SharePoint site's document library. |
+| `-SharePointFolderPath` | Destination folder in the library (default: library root). |
+| `-SkipSharePointUpload` | Never upload and never prompt; keep the packet local. |
 | `-WhatIf` | Preview every change without applying it. |
 
 ## Reversing an offboarding
