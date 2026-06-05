@@ -1,0 +1,109 @@
+{
+  "tool": "Invoke-M365Offboarding",
+  "schemaVersion": "1.0",
+  "targetUpn": "jdoe@contoso.com",
+  "performedBy": "Offboarding App (1f3c0a2e-...)",
+  "offboardingDate": "2026-06-05",
+  "startedUtc": "2026-06-05 18:23:11 UTC",
+  "completedUtc": "2026-06-05 18:25:02 UTC",
+  "steps": [
+    {
+      "step": 0,
+      "timestampUtc": "2026-06-05 18:23:11 UTC",
+      "action": "Connected to Microsoft Graph and Exchange Online",
+      "result": "Authenticated as Offboarding App (1f3c0a2e-...)",
+      "screenshot": null,
+      "details": "Target: jdoe@contoso.com."
+    },
+    {
+      "step": 1,
+      "timestampUtc": "2026-06-05 18:23:14 UTC",
+      "action": "Reset password and revoked all sign-in sessions",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Password set to a random value (not retained). Revoke-MgUserSignInSession invalidates issued refresh tokens."
+    },
+    {
+      "step": 2,
+      "timestampUtc": "2026-06-05 18:23:20 UTC",
+      "action": "Set AccountEnabled to false",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Confirmed via Get-MgUser: AccountEnabled = false."
+    },
+    {
+      "step": 3,
+      "timestampUtc": "2026-06-05 18:23:31 UTC",
+      "action": "Removed ActiveSync mobile device partnerships",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Removed 1 ActiveSync partnership(s):\n  - Galaxy S24 [SEC1234567890]"
+    },
+    {
+      "step": 4,
+      "timestampUtc": "2026-06-05 18:23:48 UTC",
+      "action": "Removed registered authentication (MFA) methods",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Removable methods: 2\n  Removed: #microsoft.graph.microsoftAuthenticatorAuthenticationMethod (...)\n  Removed: #microsoft.graph.phoneAuthenticationMethod (...)"
+    },
+    {
+      "step": 5,
+      "timestampUtc": "2026-06-05 18:24:01 UTC",
+      "action": "Revoked 2 OAuth2 grant(s)",
+      "result": "Success",
+      "screenshot": null,
+      "details": "OAuth2 grants found: 2\n  - GrantId=..., ClientId=..., Scope=Mail.Read offline_access"
+    },
+    {
+      "step": 6,
+      "timestampUtc": "2026-06-05 18:24:14 UTC",
+      "action": "Removed user from 4 cloud-managed group(s)",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Group memberships: 5 total, 4 cloud-managed."
+    },
+    {
+      "step": 7,
+      "timestampUtc": "2026-06-05 18:24:20 UTC",
+      "action": "Configured forwarding / delegation as requested",
+      "result": "Success",
+      "screenshot": null,
+      "details": "No forwarding or delegation requested for this user."
+    },
+    {
+      "step": 8,
+      "timestampUtc": "2026-06-05 18:24:39 UTC",
+      "action": "Converted user mailbox to shared mailbox",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Set-Mailbox -Type Shared executed. Verified RecipientTypeDetails = SharedMailbox."
+    },
+    {
+      "step": 9,
+      "timestampUtc": "2026-06-05 18:24:51 UTC",
+      "action": "Removed all Microsoft 365 licenses",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Removed 1 license SKUs: c7df2760-2c81-4ef7-b578-5b5392b571df."
+    },
+    {
+      "step": 10,
+      "timestampUtc": "2026-06-05 18:25:02 UTC",
+      "action": "Added user to 'Offboarded Users' (targeted by CA block)",
+      "result": "Success",
+      "screenshot": null,
+      "details": "Group 'Offboarded Users' (Id: ...): user added.\nCA policy 'Block sign-in for offboarded users' (Id: ...), state: enabledForReportingButNotEnforced."
+    }
+  ],
+  "finalState": {
+    "User principal name": "jdoe@contoso.com",
+    "Display name": "Jane Doe",
+    "Account enabled": false,
+    "Assigned licenses": "None",
+    "Recipient type details": "SharedMailbox",
+    "Forwarding address": "None",
+    "Mobile device partnerships": 0
+  },
+  "success": true
+}

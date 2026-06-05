@@ -1,0 +1,20 @@
+# Audit output (never commit real offboarding records)
+*_20*/
+AUDIT.md
+audit.json
+*.png
+
+# Local tooling and secrets
+tools/
+*.pfx
+*.cer
+*.key
+secrets.json
+config.local.json
+
+# OS and editor noise
+Thumbs.db
+.DS_Store
+*.swp
+.vscode/
+*:Zone.Identifier

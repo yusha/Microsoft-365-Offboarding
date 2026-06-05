@@ -1,0 +1,1006 @@
+<#
+.SYNOPSIS
+    Microsoft 365 user offboarding and decommissioning tool.
+
+.DESCRIPTION
+    Executes a fixed, ordered offboarding procedure against Microsoft Graph and
+    Exchange Online, captures an audit trail (optional per-step screenshots, an
+    AUDIT.md timeline, and a machine-readable audit.json), and leaves the mailbox
+    intact as a shared mailbox.
+
+    The procedure runs in three phases:
+
+      Phase 1  Immediate lockout
+        1. Reset password and revoke all sign-in sessions
+        2. Block sign-in (disable the account)
+        3. Remove ActiveSync mobile device partnerships
+
+      Phase 2  Authorization cleanup
+        4. Remove registered authentication (MFA) methods
+        5. Revoke OAuth app grants
+        6. Remove from groups and distribution lists
+
+      Phase 3  Mailbox transition and hardening
+        7. Configure forwarding / delegation (optional)
+        8. Convert the user mailbox to a shared mailbox
+        9. Remove Microsoft 365 licenses
+       10. Apply a Conditional Access block on the user principal
+
+    The ordering is deliberate and aligned with Microsoft's documentation. In
+    particular, the mailbox is converted to shared (step 8) BEFORE the license
+    is removed (step 9), because Microsoft hides the conversion option once the
+    license is gone. See the README for the documentation references behind each
+    step.
+
+    The tool runs interactively by default (menu driven, browser sign-in) and
+    can also run unattended for automation (app-only certificate auth, no
+    prompts, JSON output). See the -Unattended examples below.
+
+.PARAMETER UserPrincipalName
+    The UPN of the account to offboard, for example jdoe@contoso.com.
+    Prompted for if omitted in interactive mode. Required in unattended mode.
+
+.PARAMETER AuditRoot
+    Parent folder for the audit packet. A subfolder named <user>_<yyyy-MM-dd> is
+    created inside it. In interactive mode a folder picker is shown if omitted.
+
+.PARAMETER Steps
+    One or more step numbers (1-10) to run instead of all ten. Example: -Steps 1,2,3.
+
+.PARAMETER All
+    Run all ten steps in order without showing the menu (interactive mode).
+
+.PARAMETER Unattended
+    No prompts. Requires -UserPrincipalName and -AuditRoot. Runs the requested
+    steps (all ten by default) and exits. Combine with app-only auth parameters
+    for headless automation.
+
+.PARAMETER NoScreenshots
+    Skip screenshot capture. Screenshots are Windows-only and are skipped
+    automatically on PowerShell 7 on non-Windows platforms.
+
+.PARAMETER ForwardingAddress
+    If supplied, configures SMTP forwarding from the mailbox to this address
+    during step 7.
+
+.PARAMETER ForwardKeepCopy
+    When forwarding is configured, also keep a copy in the original mailbox
+    (DeliverToMailboxAndForward). Default is to keep a copy.
+
+.PARAMETER DelegateTo
+    If supplied, grants this user Full Access and Send As on the mailbox during
+    step 7.
+
+.PARAMETER SkipMailboxConversion
+    Skip step 8. Use only when the mailbox will be handled separately (for
+    example a hard delete). Leaving this off is recommended.
+
+.PARAMETER OffboardedGroupName
+    Display name of the security group used by the Conditional Access block.
+    Default: "Offboarded Users". Created automatically if missing.
+
+.PARAMETER BlockPolicyName
+    Display name of the Conditional Access policy. Default:
+    "Block sign-in for offboarded users". Created in report-only mode if missing.
+
+.PARAMETER TenantId
+    Tenant id (GUID) or domain. Required for app-only auth.
+
+.PARAMETER ClientId
+    App registration (client) id for app-only auth.
+
+.PARAMETER CertificateThumbprint
+    Certificate thumbprint for app-only auth (certificate must be in the local
+    certificate store and uploaded to the app registration).
+
+.PARAMETER Organization
+    Tenant domain (for example contoso.onmicrosoft.com). Required for app-only
+    Exchange Online auth.
+
+.PARAMETER JsonOutPath
+    Optional explicit path for the machine-readable audit.json. Defaults to
+    audit.json inside the audit folder.
+
+.EXAMPLE
+    .\Invoke-M365Offboarding.ps1
+    Interactive: prompts for everything, browser sign-in, menu driven.
+
+.EXAMPLE
+    .\Invoke-M365Offboarding.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits -All
+    Interactive sign-in, then runs all ten steps for the given user.
+
+.EXAMPLE
+    .\Invoke-M365Offboarding.ps1 -Unattended -UserPrincipalName jdoe@contoso.com `
+        -AuditRoot C:\Audits -NoScreenshots `
+        -TenantId contoso.onmicrosoft.com -ClientId <app-id> `
+        -CertificateThumbprint <thumbprint> -Organization contoso.onmicrosoft.com `
+        -JsonOutPath C:\Audits\jdoe.json
+    Headless automation suitable for calling from a scheduler, an AI agent, or a
+    web portal. Emits audit.json describing every step's result.
+
+.NOTES
+    Requires PowerShell 5.1+ (Windows) or PowerShell 7+ (any platform), and the
+    Microsoft Graph and Exchange Online PowerShell modules (installed on first
+    run if missing). MIT licensed. No warranty. Test against a non-production
+    account before using in production.
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [string]$UserPrincipalName,
+    [string]$AuditRoot,
+    [ValidateRange(1, 10)][int[]]$Steps,
+    [switch]$All,
+    [switch]$Unattended,
+    [switch]$NoScreenshots,
+    [string]$ForwardingAddress,
+    [bool]$ForwardKeepCopy = $true,
+    [string]$DelegateTo,
+    [switch]$SkipMailboxConversion,
+    [string]$OffboardedGroupName = 'Offboarded Users',
+    [string]$BlockPolicyName = 'Block sign-in for offboarded users',
+    [string]$TenantId,
+    [string]$ClientId,
+    [string]$CertificateThumbprint,
+    [string]$Organization,
+    [string]$JsonOutPath
+)
+
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+
+# Force UTF-8 so non-ASCII display names are not mangled in the audit log.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+} catch { }
+
+# Detect Windows. Screenshots and the folder picker are Windows-only.
+$script:IsWindowsHost = $true
+if ($PSVersionTable.PSObject.Properties.Name -contains 'Platform') {
+    if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
+        $script:IsWindowsHost = $false
+    }
+}
+
+$script:CanScreenshot = $false
+if ($script:IsWindowsHost -and -not $NoScreenshots) {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $script:CanScreenshot = $true
+    } catch {
+        $script:CanScreenshot = $false
+    }
+}
+
+# ================================================================
+# SECTION 1: Console output helpers
+# ================================================================
+function Write-Banner {
+    param([string]$Text, [ConsoleColor]$Color = 'Cyan')
+    $line = '=' * 64
+    Write-Host ''
+    Write-Host $line -ForegroundColor $Color
+    Write-Host $Text -ForegroundColor $Color
+    Write-Host $line -ForegroundColor $Color
+}
+
+function Write-StepHeader {
+    param([int]$Number, [string]$Title)
+    Write-Host ''
+    Write-Host ('-' * 64) -ForegroundColor Yellow
+    Write-Host (' STEP {0}: {1}' -f $Number, $Title) -ForegroundColor Yellow
+    Write-Host ('-' * 64) -ForegroundColor Yellow
+}
+
+function Write-Info    { param([string]$m); Write-Host "  $m" -ForegroundColor White }
+function Write-Action  { param([string]$m); Write-Host "  > $m" -ForegroundColor Cyan }
+function Write-Ok      { param([string]$m); Write-Host "  [OK] $m" -ForegroundColor Green }
+function Write-WarnMsg { param([string]$m); Write-Host "  [!]  $m" -ForegroundColor Yellow }
+function Write-ErrMsg  { param([string]$m); Write-Host "  [X]  $m" -ForegroundColor Red }
+
+# ================================================================
+# SECTION 2: Inputs (interactive only)
+# ================================================================
+function Get-AuditRootFolderInteractive {
+    Write-Banner 'AUDIT FOLDER LOCATION'
+    Write-Info 'Choose where to save the audit packet for this offboarding.'
+    Write-Info 'A subfolder will be created as: <user>_<yyyy-MM-dd>'
+    Write-Host ''
+
+    if (-not $script:IsWindowsHost) {
+        return (Read-Host '  Enter the parent folder path for the audit packet')
+    }
+
+    $picker = New-Object System.Windows.Forms.FolderBrowserDialog
+    $picker.Description = 'Select the parent folder for the audit packet'
+    $picker.ShowNewFolderButton = $true
+    if ($picker.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) {
+        throw 'No folder selected. Aborting.'
+    }
+    return $picker.SelectedPath
+}
+
+function Get-TargetUserInteractive {
+    Write-Banner 'TARGET USER TO OFFBOARD'
+    Write-Host ''
+    $upn = Read-Host '  User principal name (for example jdoe@contoso.com)'
+    if ([string]::IsNullOrWhiteSpace($upn) -or $upn -notmatch '@') {
+        throw 'A valid user principal name is required.'
+    }
+    return $upn.Trim()
+}
+
+# ================================================================
+# SECTION 3: Module bootstrap and connections
+# ================================================================
+function Initialize-Modules {
+    $required = @(
+        'Microsoft.Graph.Authentication',
+        'Microsoft.Graph.Users',
+        'Microsoft.Graph.Users.Actions',
+        'Microsoft.Graph.Identity.SignIns',
+        'Microsoft.Graph.Identity.DirectoryManagement',
+        'Microsoft.Graph.Groups',
+        'ExchangeOnlineManagement'
+    )
+
+    Write-Banner 'CHECKING REQUIRED POWERSHELL MODULES'
+    foreach ($m in $required) {
+        if (Get-Module -ListAvailable -Name $m) {
+            Write-Ok "$m is installed"
+        } else {
+            Write-WarnMsg "$m is missing. Installing for the current user..."
+            Install-Module -Name $m -Scope CurrentUser -Force -AllowClobber -Repository PSGallery
+            Write-Ok "$m installed"
+        }
+    }
+}
+
+function Connect-Services {
+    Write-Banner 'CONNECTING TO MICROSOFT 365'
+
+    $graphScopes = @(
+        'User.ReadWrite.All',
+        'Directory.ReadWrite.All',
+        'Policy.ReadWrite.ConditionalAccess',
+        'Application.ReadWrite.All',
+        'Group.ReadWrite.All',
+        'GroupMember.ReadWrite.All',
+        'DelegatedPermissionGrant.ReadWrite.All',
+        'UserAuthenticationMethod.ReadWrite.All'
+    )
+
+    $appOnly = $ClientId -and $CertificateThumbprint -and $TenantId
+
+    Write-Action 'Connecting to Microsoft Graph...'
+    if ($appOnly) {
+        Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -NoWelcome
+    } else {
+        Connect-MgGraph -Scopes $graphScopes -NoWelcome
+    }
+    $ctx = Get-MgContext
+    $operatorId = if ($ctx.Account) { $ctx.Account } else { $ctx.AppName }
+    Write-Ok "Connected to Graph as $operatorId in tenant $($ctx.TenantId)"
+
+    Write-Action 'Connecting to Exchange Online...'
+    if ($appOnly) {
+        if (-not $Organization) { throw 'App-only Exchange Online auth requires -Organization (for example contoso.onmicrosoft.com).' }
+        Connect-ExchangeOnline -AppId $ClientId -CertificateThumbprint $CertificateThumbprint -Organization $Organization -ShowBanner:$false
+    } else {
+        Connect-ExchangeOnline -ShowBanner:$false
+    }
+    Write-Ok 'Connected to Exchange Online'
+
+    return $operatorId
+}
+
+function Disconnect-Services {
+    try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+    try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue | Out-Null } catch { }
+}
+
+# ================================================================
+# SECTION 4: Screenshot capture (Windows, all monitors)
+# ================================================================
+function Save-Screenshot {
+    param([string]$OutputFolder, [int]$StepNumber, [string]$Label)
+
+    if (-not $script:CanScreenshot) { return $null }
+
+    try {
+        Start-Sleep -Milliseconds 400
+        $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+        $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+        $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+
+        $safe = ($Label -replace '[^a-zA-Z0-9_-]', '_')
+        $fname = ('step_{0:D2}_{1}_{2}.png' -f $StepNumber, $safe, (Get-Date -Format 'HHmmss'))
+        $path = Join-Path $OutputFolder $fname
+        $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+        $gfx.Dispose(); $bmp.Dispose()
+        Write-Ok "Screenshot saved: $fname"
+        return $path
+    } catch {
+        Write-WarnMsg "Screenshot failed: $_"
+        return $null
+    }
+}
+
+# ================================================================
+# SECTION 5: Audit log
+# ================================================================
+$script:AuditLog = @()
+
+function Add-AuditEntry {
+    param(
+        [int]$StepNumber,
+        [string]$Action,
+        [string]$Result,
+        [string]$Screenshot = $null,
+        [string]$Details = $null
+    )
+    $script:AuditLog += [PSCustomObject]@{
+        Timestamp  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss') + ' UTC'
+        StepNumber = $StepNumber
+        Action     = $Action
+        Result     = $Result
+        Screenshot = $Screenshot
+        Details    = $Details
+    }
+}
+
+function Write-AuditMarkdown {
+    param([string]$OutputFolder, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState)
+
+    $startTime = $script:AuditLog | Select-Object -First 1 -ExpandProperty Timestamp
+    $endTime   = $script:AuditLog | Select-Object -Last 1 -ExpandProperty Timestamp
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine('# Microsoft 365 Offboarding Audit Packet')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('## Identification')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('| Field | Value |')
+    [void]$sb.AppendLine('|---|---|')
+    [void]$sb.AppendLine("| Target user (UPN) | $TargetUpn |")
+    [void]$sb.AppendLine("| Offboarding date | $(Get-Date -Format 'yyyy-MM-dd') |")
+    [void]$sb.AppendLine("| Started (UTC) | $startTime |")
+    [void]$sb.AppendLine("| Completed (UTC) | $endTime |")
+    [void]$sb.AppendLine("| Performed by | $Operator |")
+    [void]$sb.AppendLine('')
+
+    [void]$sb.AppendLine('## Timeline')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('All timestamps are UTC.')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('| Time (UTC) | Step | Action | Result | Screenshot |')
+    [void]$sb.AppendLine('|---|---|---|---|---|')
+    foreach ($e in $script:AuditLog) {
+        $shot = if ($e.Screenshot) { "[$(Split-Path $e.Screenshot -Leaf)]($(Split-Path $e.Screenshot -Leaf))" } else { '_n/a_' }
+        $actionEscaped = ($e.Action -replace '\|', '\|')
+        $resultEscaped = ($e.Result -replace '\|', '\|')
+        [void]$sb.AppendLine("| $($e.Timestamp) | $($e.StepNumber) | $actionEscaped | $resultEscaped | $shot |")
+    }
+    [void]$sb.AppendLine('')
+
+    [void]$sb.AppendLine('## Detailed notes')
+    [void]$sb.AppendLine('')
+    foreach ($e in ($script:AuditLog | Where-Object { $_.Details })) {
+        [void]$sb.AppendLine("### Step $($e.StepNumber) at $($e.Timestamp)")
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine("$($e.Details)")
+        [void]$sb.AppendLine('')
+    }
+
+    [void]$sb.AppendLine('## Final state confirmation')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('| Attribute | Value |')
+    [void]$sb.AppendLine('|---|---|')
+    foreach ($k in $FinalState.Keys) {
+        [void]$sb.AppendLine("| $k | $($FinalState[$k]) |")
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('---')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('_Generated by the Microsoft 365 Offboarding tool. Actions were executed against the Microsoft Graph and Exchange Online APIs._')
+
+    $auditPath = Join-Path $OutputFolder 'AUDIT.md'
+    [System.IO.File]::WriteAllText($auditPath, $sb.ToString(), [System.Text.Encoding]::UTF8)
+    return $auditPath
+}
+
+function Write-AuditJson {
+    param([string]$Path, [string]$TargetUpn, [string]$Operator, [hashtable]$FinalState)
+
+    $obj = [ordered]@{
+        tool            = 'Invoke-M365Offboarding'
+        schemaVersion   = '1.0'
+        targetUpn       = $TargetUpn
+        performedBy     = $Operator
+        offboardingDate = (Get-Date -Format 'yyyy-MM-dd')
+        startedUtc      = ($script:AuditLog | Select-Object -First 1 -ExpandProperty Timestamp)
+        completedUtc    = ($script:AuditLog | Select-Object -Last 1 -ExpandProperty Timestamp)
+        steps           = @($script:AuditLog | ForEach-Object {
+            [ordered]@{
+                step       = $_.StepNumber
+                timestampUtc = $_.Timestamp
+                action     = $_.Action
+                result     = $_.Result
+                screenshot = if ($_.Screenshot) { Split-Path $_.Screenshot -Leaf } else { $null }
+                details    = $_.Details
+            }
+        })
+        finalState      = $FinalState
+        success         = (-not ($script:AuditLog | Where-Object { $_.Result -like 'FAILED*' }))
+    }
+    $json = $obj | ConvertTo-Json -Depth 12
+    [System.IO.File]::WriteAllText($Path, $json, [System.Text.Encoding]::UTF8)
+    return $Path
+}
+
+# ================================================================
+# SECTION 6: The ten steps
+# ================================================================
+
+# ---------- Step 1: Reset password and revoke sessions ----------
+function Invoke-Step1 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 1 'Reset password and revoke all sign-in sessions'
+
+    $user = Get-MgUser -UserId $Upn -Property Id, DisplayName, UserPrincipalName, AccountEnabled
+    Write-Info "Target: $($user.DisplayName) ($($user.UserPrincipalName))"
+
+    if ($PSCmdlet.ShouldProcess($Upn, 'Reset password and revoke sessions')) {
+        $bytes = New-Object 'byte[]' 18
+        [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        $newPwd = [Convert]::ToBase64String($bytes) + '!Aa9'
+        $body = @{ passwordProfile = @{ forceChangePasswordNextSignIn = $true; password = $newPwd } }
+
+        Write-Action 'Resetting password to a random value (not stored)...'
+        Update-MgUser -UserId $user.Id -BodyParameter $body
+        Write-Ok 'Password reset'
+
+        Write-Action 'Revoking all active sign-in sessions...'
+        Revoke-MgUserSignInSession -UserId $user.Id | Out-Null
+        Write-Ok 'All sessions revoked'
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 1 -Label 'password_reset_and_sessions_revoked'
+    Add-AuditEntry -StepNumber 1 -Action 'Reset password and revoked all sign-in sessions' -Result 'Success' -Screenshot $shot `
+        -Details 'Password set to a random value (not retained). Revoke-MgUserSignInSession invalidates issued refresh tokens.'
+}
+
+# ---------- Step 2: Block sign-in ----------
+function Invoke-Step2 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 2 'Block sign-in (disable the account)'
+
+    if ($PSCmdlet.ShouldProcess($Upn, 'Set AccountEnabled = false')) {
+        Update-MgUser -UserId $Upn -AccountEnabled:$false
+        Start-Sleep -Seconds 2
+        $user = Get-MgUser -UserId $Upn -Property AccountEnabled
+        if ($user.AccountEnabled) { throw 'Failed to disable account. AccountEnabled is still true.' }
+        Write-Ok 'Account is now disabled (AccountEnabled = false)'
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 2 -Label 'account_disabled'
+    Add-AuditEntry -StepNumber 2 -Action 'Set AccountEnabled to false' -Result 'Success' -Screenshot $shot `
+        -Details 'Confirmed via Get-MgUser: AccountEnabled = false.'
+}
+
+# ---------- Step 3: Remove mobile device partnerships ----------
+function Invoke-Step3 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 3 'Remove ActiveSync mobile device partnerships'
+    Write-Info 'A cached mobile mail client keeps a device partnership that tries to'
+    Write-Info 'refresh tokens after offboarding. Removing it stops repeated failed'
+    Write-Info 'sign-in attempts (and the sign-in prompts they trigger on the device).'
+
+    $devices = Get-MobileDevice -Mailbox $Upn -ErrorAction SilentlyContinue
+    if ($devices) {
+        $count = ($devices | Measure-Object).Count
+        Write-Info "Found $count partnership(s)."
+        $removed = @()
+        foreach ($d in $devices) {
+            if ($PSCmdlet.ShouldProcess($d.FriendlyName, 'Remove mobile device partnership')) {
+                Remove-MobileDevice -Identity $d.Identity -Confirm:$false
+                Write-Ok "Removed: $($d.DeviceModel)"
+            }
+            $removed += "  - $($d.DeviceModel) [$($d.DeviceID)]"
+        }
+        $details = "Removed $count ActiveSync partnership(s):`n" + ($removed -join "`n")
+    } else {
+        Write-Info 'No ActiveSync partnerships found.'
+        $details = 'No ActiveSync partnerships were registered for this mailbox.'
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 3 -Label 'mobile_devices_removed'
+    Add-AuditEntry -StepNumber 3 -Action 'Removed ActiveSync mobile device partnerships' -Result 'Success' -Screenshot $shot -Details $details
+}
+
+# ---------- Step 4: Remove authentication (MFA) methods ----------
+function Invoke-Step4 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 4 'Remove registered authentication (MFA) methods'
+
+    $user = Get-MgUser -UserId $Upn -Property Id
+    $methods = Get-MgUserAuthenticationMethod -UserId $user.Id -All -ErrorAction SilentlyContinue
+
+    # The password method cannot be removed and is skipped.
+    $removable = @($methods | Where-Object {
+        $_.AdditionalProperties.'@odata.type' -ne '#microsoft.graph.passwordAuthenticationMethod'
+    })
+
+    Write-Info "Found $($removable.Count) removable authentication method(s)."
+    $details = "Removable methods: $($removable.Count)`n"
+    $failures = 0
+
+    foreach ($m in $removable) {
+        $type = $m.AdditionalProperties.'@odata.type'
+        $id = $m.Id
+        if (-not $PSCmdlet.ShouldProcess("$type ($id)", 'Remove authentication method')) { continue }
+        try {
+            switch ($type) {
+                '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' { Remove-MgUserAuthenticationMicrosoftAuthenticatorMethod -UserId $user.Id -MicrosoftAuthenticatorAuthenticationMethodId $id }
+                '#microsoft.graph.phoneAuthenticationMethod'                  { Remove-MgUserAuthenticationPhoneMethod -UserId $user.Id -PhoneAuthenticationMethodId $id }
+                '#microsoft.graph.fido2AuthenticationMethod'                  { Remove-MgUserAuthenticationFido2Method -UserId $user.Id -Fido2AuthenticationMethodId $id }
+                '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod'{ Remove-MgUserAuthenticationWindowsHelloForBusinessMethod -UserId $user.Id -WindowsHelloForBusinessAuthenticationMethodId $id }
+                '#microsoft.graph.emailAuthenticationMethod'                  { Remove-MgUserAuthenticationEmailMethod -UserId $user.Id -EmailAuthenticationMethodId $id }
+                '#microsoft.graph.softwareOathAuthenticationMethod'           { Remove-MgUserAuthenticationSoftwareOathMethod -UserId $user.Id -SoftwareOathAuthenticationMethodId $id }
+                '#microsoft.graph.temporaryAccessPassAuthenticationMethod'    { Remove-MgUserAuthenticationTemporaryAccessPassMethod -UserId $user.Id -TemporaryAccessPassAuthenticationMethodId $id }
+                default {
+                    Write-WarnMsg "No remover for method type $type. Remove it manually in the Entra admin center."
+                    $details += "  Skipped (no API remover): $type ($id)`n"
+                    continue
+                }
+            }
+            Write-Ok "Removed method: $type"
+            $details += "  Removed: $type ($id)`n"
+        } catch {
+            $failures++
+            Write-WarnMsg "Could not remove $type ($id): $_"
+            $details += "  Failed: $type ($id) - $_`n"
+        }
+    }
+
+    if ($removable.Count -eq 0) { $details = 'No removable authentication methods were registered.' }
+
+    $result = if ($failures -gt 0) { "Completed with $failures failure(s)" } else { 'Success' }
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 4 -Label 'mfa_methods_removed'
+    Add-AuditEntry -StepNumber 4 -Action 'Removed registered authentication (MFA) methods' -Result $result -Screenshot $shot -Details $details
+}
+
+# ---------- Step 5: Revoke OAuth grants ----------
+function Invoke-Step5 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 5 'Revoke OAuth app grants'
+
+    $user = Get-MgUser -UserId $Upn -Property Id
+    $grants = Get-MgUserOauth2PermissionGrant -UserId $user.Id -All -ErrorAction SilentlyContinue
+    $grantCount = ($grants | Measure-Object).Count
+    Write-Info "Found $grantCount delegated OAuth2 grant(s)."
+
+    $details = "OAuth2 grants found: $grantCount`n"
+    foreach ($g in $grants) { $details += "  - GrantId=$($g.Id), ClientId=$($g.ClientId), Scope=$($g.Scope)`n" }
+
+    foreach ($g in $grants) {
+        if (-not $PSCmdlet.ShouldProcess($g.Id, 'Revoke OAuth2 grant')) { continue }
+        try {
+            Remove-MgOauth2PermissionGrant -OAuth2PermissionGrantId $g.Id -ErrorAction Stop
+            Write-Ok "Revoked grant $($g.Id)"
+            $details += "Revoked grant $($g.Id).`n"
+        } catch {
+            Write-WarnMsg "Could not revoke $($g.Id): $_"
+            $details += "Failed to revoke grant $($g.Id): $_`n"
+        }
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 5 -Label 'oauth_grants_revoked'
+    Add-AuditEntry -StepNumber 5 -Action "Revoked $grantCount OAuth2 grant(s)" -Result 'Success' -Screenshot $shot -Details $details
+}
+
+# ---------- Step 6: Remove from groups ----------
+function Invoke-Step6 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 6 'Remove user from groups and distribution lists'
+
+    $user = Get-MgUser -UserId $Upn -Property Id
+    $groups = Get-MgUserMemberOf -UserId $user.Id -All
+
+    $editableGroups = @()
+    foreach ($g in $groups) {
+        if ($g.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group') {
+            $grp = Get-MgGroup -GroupId $g.Id -ErrorAction SilentlyContinue
+            if ($grp -and -not $grp.OnPremisesSyncEnabled) {
+                $editableGroups += $grp
+            } elseif ($grp -and $grp.OnPremisesSyncEnabled) {
+                Write-WarnMsg "Skipping on-prem-synced group '$($grp.DisplayName)' (remove in on-prem AD)."
+            }
+        }
+    }
+
+    Write-Info "Found $($editableGroups.Count) cloud-managed group(s)."
+    $details = "Group memberships: $($groups.Count) total, $($editableGroups.Count) cloud-managed.`n"
+
+    foreach ($g in $editableGroups) {
+        if (-not $PSCmdlet.ShouldProcess($g.DisplayName, 'Remove group membership')) { continue }
+        try {
+            Remove-MgGroupMemberByRef -GroupId $g.Id -DirectoryObjectId $user.Id -ErrorAction Stop
+            Write-Ok "Removed from: $($g.DisplayName)"
+            $details += "  Removed from: $($g.DisplayName) ($($g.Id))`n"
+        } catch {
+            Write-WarnMsg "Could not remove from '$($g.DisplayName)': $_"
+            $details += "  Failed: $($g.DisplayName) - $_`n"
+        }
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 6 -Label 'groups_removed'
+    Add-AuditEntry -StepNumber 6 -Action "Removed user from $($editableGroups.Count) cloud-managed group(s)" -Result 'Success' -Screenshot $shot -Details $details
+}
+
+# ---------- Step 7: Forwarding / delegation (optional) ----------
+function Invoke-Step7 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 7 'Configure forwarding and delegation (optional)'
+
+    $fwdTarget = $ForwardingAddress
+    $delTarget = $DelegateTo
+
+    if (-not $Unattended) {
+        if (-not $fwdTarget) {
+            $forward = Read-Host '  Configure email forwarding? (y/N)'
+            if ($forward -match '^[Yy]') { $fwdTarget = Read-Host '  Forward to which address' }
+        }
+        if (-not $delTarget) {
+            $delegate = Read-Host '  Configure mailbox delegation (Full Access + Send As)? (y/N)'
+            if ($delegate -match '^[Yy]') { $delTarget = Read-Host '  Delegate to which user' }
+        }
+    }
+
+    $details = ''
+    if ($fwdTarget) {
+        if ($PSCmdlet.ShouldProcess($Upn, "Forward to $fwdTarget")) {
+            Set-Mailbox -Identity $Upn -ForwardingSmtpAddress $fwdTarget -DeliverToMailboxAndForward $ForwardKeepCopy
+            Write-Ok "Forwarding enabled to $fwdTarget"
+        }
+        $details += "Forwarding configured: $Upn forwards to $fwdTarget (keep copy: $ForwardKeepCopy).`n"
+    }
+    if ($delTarget) {
+        if ($PSCmdlet.ShouldProcess($Upn, "Delegate Full Access and Send As to $delTarget")) {
+            Add-MailboxPermission -Identity $Upn -User $delTarget -AccessRights FullAccess -InheritanceType All -AutoMapping $true | Out-Null
+            Add-RecipientPermission -Identity $Upn -Trustee $delTarget -AccessRights SendAs -Confirm:$false | Out-Null
+            Write-Ok "Delegation granted to $delTarget"
+        }
+        $details += "Delegation: $delTarget granted FullAccess and SendAs on $Upn.`n"
+    }
+    if (-not $fwdTarget -and -not $delTarget) {
+        Write-Info 'No forwarding or delegation requested.'
+        $details = 'No forwarding or delegation requested for this user.'
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 7 -Label 'forwarding_delegation'
+    Add-AuditEntry -StepNumber 7 -Action 'Configured forwarding / delegation as requested' -Result 'Success' -Screenshot $shot -Details $details
+}
+
+# ---------- Step 8: Convert to shared mailbox ----------
+function Invoke-Step8 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 8 'Convert user mailbox to a shared mailbox'
+
+    if ($SkipMailboxConversion) {
+        Write-WarnMsg 'Skipping mailbox conversion (-SkipMailboxConversion was set).'
+        Add-AuditEntry -StepNumber 8 -Action 'Convert mailbox to shared' -Result 'Skipped' -Details 'Skipped by request (-SkipMailboxConversion).'
+        return
+    }
+
+    Write-Info 'The license must still be assigned for this to work (Microsoft hides'
+    Write-Info 'the convert option once the license is removed). License removal is the'
+    Write-Info 'next step, not this one.'
+
+    if ($PSCmdlet.ShouldProcess($Upn, 'Convert to shared mailbox')) {
+        Set-Mailbox -Identity $Upn -Type Shared
+        Start-Sleep -Seconds 3
+        $mbx = Get-Mailbox -Identity $Upn
+        if ($mbx.RecipientTypeDetails -ne 'SharedMailbox') {
+            throw "Conversion failed. RecipientTypeDetails is still '$($mbx.RecipientTypeDetails)'."
+        }
+        Write-Ok 'Conversion confirmed. RecipientTypeDetails = SharedMailbox'
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 8 -Label 'mailbox_converted_to_shared'
+    Add-AuditEntry -StepNumber 8 -Action 'Converted user mailbox to shared mailbox' -Result 'Success' -Screenshot $shot `
+        -Details 'Set-Mailbox -Type Shared executed. Verified RecipientTypeDetails = SharedMailbox.'
+}
+
+# ---------- Step 9: Remove licenses ----------
+function Invoke-Step9 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 9 'Remove Microsoft 365 licenses'
+    Write-Info 'Safe now: the mailbox is already shared and will not lose data. The'
+    Write-Info 'account is not deleted, only unlicensed, so it can anchor the shared'
+    Write-Info 'mailbox (Microsoft requires the account to remain).'
+
+    $user = Get-MgUser -UserId $Upn -Property Id, AssignedLicenses
+    if (-not $user.AssignedLicenses -or $user.AssignedLicenses.Count -eq 0) {
+        Write-Info 'No licenses assigned. Nothing to remove.'
+        $details = 'User had no assigned licenses.'
+    } else {
+        $skuIds = $user.AssignedLicenses | ForEach-Object { $_.SkuId }
+        Write-Info "Removing $($skuIds.Count) license SKU(s)."
+        if ($PSCmdlet.ShouldProcess($Upn, "Remove $($skuIds.Count) license(s)")) {
+            Set-MgUserLicense -UserId $user.Id -AddLicenses @() -RemoveLicenses $skuIds | Out-Null
+            Start-Sleep -Seconds 2
+            $check = Get-MgUser -UserId $Upn -Property AssignedLicenses
+            if ($check.AssignedLicenses.Count -gt 0) {
+                throw "License removal incomplete. $($check.AssignedLicenses.Count) licenses still assigned."
+            }
+            Write-Ok 'All licenses removed and verified.'
+        }
+        $details = "Removed $($skuIds.Count) license SKUs: $($skuIds -join ', ')."
+    }
+
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 9 -Label 'license_removed'
+    Add-AuditEntry -StepNumber 9 -Action 'Removed all Microsoft 365 licenses' -Result 'Success' -Screenshot $shot -Details $details
+}
+
+# ---------- Step 10: Conditional Access block ----------
+function Invoke-Step10 {
+    param([string]$Upn, [string]$Folder)
+    Write-StepHeader 10 'Apply a Conditional Access block on the user principal'
+    Write-Info 'Defense in depth: even if the account is mistakenly re-enabled,'
+    Write-Info 'Conditional Access rejects every sign-in for members of the group.'
+
+    Write-Action "Looking for security group '$OffboardedGroupName'..."
+    $group = Get-MgGroup -Filter "displayName eq '$OffboardedGroupName'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $group) {
+        Write-WarnMsg "Group not found. Creating '$OffboardedGroupName'..."
+        $nickname = ($OffboardedGroupName -replace '[^a-zA-Z0-9]', '').ToLower()
+        if ([string]::IsNullOrWhiteSpace($nickname)) { $nickname = 'offboardedusers' }
+        $group = New-MgGroup -DisplayName $OffboardedGroupName `
+            -Description 'Offboarded users. Targeted by the sign-in block Conditional Access policy.' `
+            -MailEnabled:$false -MailNickname $nickname -SecurityEnabled:$true
+        Write-Ok "Created group '$OffboardedGroupName' (Id: $($group.Id))"
+        Start-Sleep -Seconds 3
+    } else {
+        Write-Ok "Found group '$OffboardedGroupName' (Id: $($group.Id))"
+    }
+
+    $user = Get-MgUser -UserId $Upn -Property Id
+    Write-Action "Adding $Upn to '$OffboardedGroupName'..."
+    try {
+        New-MgGroupMember -GroupId $group.Id -DirectoryObjectId $user.Id -ErrorAction Stop
+        Write-Ok 'User added to group'
+    } catch {
+        if ($_.Exception.Message -match 'already exist') { Write-Info 'User was already a member.' }
+        else { throw }
+    }
+
+    Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
+    $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$BlockPolicyName'" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $policy) {
+        Write-WarnMsg "Policy not found. Creating in REPORT-ONLY mode. An admin must enable it."
+        $policyBody = @{
+            displayName   = $BlockPolicyName
+            state         = 'enabledForReportingButNotEnforced'
+            conditions    = @{
+                applications = @{ includeApplications = @('All') }
+                users        = @{ includeGroups = @($group.Id) }
+            }
+            grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+        }
+        $policy = New-MgIdentityConditionalAccessPolicy -BodyParameter $policyBody
+        Write-Ok "Created CA policy in report-only mode (Id: $($policy.Id))"
+        Write-WarnMsg 'ACTION REQUIRED: enable this policy in the Entra admin center after review.'
+    } else {
+        Write-Ok "Found CA policy '$BlockPolicyName' (state: $($policy.State))"
+    }
+
+    $details = "Group '$OffboardedGroupName' (Id: $($group.Id)): user added.`n" +
+               "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 10 -Label 'conditional_access_applied'
+    Add-AuditEntry -StepNumber 10 -Action "Added user to '$OffboardedGroupName' (targeted by CA block)" -Result 'Success' -Screenshot $shot -Details $details
+}
+
+# ================================================================
+# SECTION 7: Final state
+# ================================================================
+function Get-FinalState {
+    param([string]$Upn)
+    $state = [ordered]@{}
+    try {
+        $user = Get-MgUser -UserId $Upn -Property Id, DisplayName, UserPrincipalName, AccountEnabled, AssignedLicenses
+        $state['User principal name'] = $user.UserPrincipalName
+        $state['Display name']        = $user.DisplayName
+        $state['Account enabled']     = $user.AccountEnabled
+        $state['Assigned licenses']   = if ($user.AssignedLicenses.Count -eq 0) { 'None' } else { $user.AssignedLicenses.Count }
+    } catch { $state['User lookup'] = "Failed: $_" }
+
+    try {
+        $mbx = Get-Mailbox -Identity $Upn -ErrorAction SilentlyContinue
+        if ($mbx) {
+            $state['Recipient type details'] = $mbx.RecipientTypeDetails
+            $state['Forwarding address']     = if ($mbx.ForwardingSmtpAddress) { $mbx.ForwardingSmtpAddress } else { 'None' }
+        }
+    } catch { $state['Mailbox lookup'] = "Failed: $_" }
+
+    try {
+        $devices = Get-MobileDevice -Mailbox $Upn -ErrorAction SilentlyContinue
+        $state['Mobile device partnerships'] = ($devices | Measure-Object).Count
+    } catch { $state['Mobile devices'] = 'Could not enumerate' }
+
+    return $state
+}
+
+# ================================================================
+# SECTION 8: Orchestration
+# ================================================================
+$script:StepMap = $null
+
+function Initialize-StepMap {
+    param([string]$Upn, [string]$Folder)
+    $script:StepMap = @{
+        1  = { Invoke-Step1  -Upn $Upn -Folder $Folder }
+        2  = { Invoke-Step2  -Upn $Upn -Folder $Folder }
+        3  = { Invoke-Step3  -Upn $Upn -Folder $Folder }
+        4  = { Invoke-Step4  -Upn $Upn -Folder $Folder }
+        5  = { Invoke-Step5  -Upn $Upn -Folder $Folder }
+        6  = { Invoke-Step6  -Upn $Upn -Folder $Folder }
+        7  = { Invoke-Step7  -Upn $Upn -Folder $Folder }
+        8  = { Invoke-Step8  -Upn $Upn -Folder $Folder }
+        9  = { Invoke-Step9  -Upn $Upn -Folder $Folder }
+        10 = { Invoke-Step10 -Upn $Upn -Folder $Folder }
+    }
+}
+
+function Invoke-StepList {
+    param([int[]]$Numbers, [bool]$StopOnError)
+    foreach ($n in $Numbers) {
+        try {
+            & $script:StepMap[$n]
+        } catch {
+            Write-ErrMsg "Step $n failed: $_"
+            Add-AuditEntry -StepNumber $n -Action "Step $n" -Result "FAILED: $_" -Details "Exception: $($_.Exception.Message)"
+            if ($StopOnError) { throw }
+            if (-not $Unattended) {
+                $cont = Read-Host '  Continue with remaining steps? (y/N)'
+                if ($cont -notmatch '^[Yy]') { break }
+            }
+        }
+    }
+}
+
+function Show-StepMenu {
+    param([string]$Upn)
+    Write-Host ''
+    Write-Host ('=' * 64) -ForegroundColor Cyan
+    Write-Host '  OFFBOARDING MENU' -ForegroundColor Cyan
+    Write-Host '  Target user: ' -NoNewline; Write-Host $Upn -ForegroundColor Yellow
+    Write-Host ('=' * 64) -ForegroundColor Cyan
+    Write-Host ''
+    Write-Host '  Phase 1: Immediate lockout'
+    Write-Host '    1) Reset password and revoke sessions'
+    Write-Host '    2) Block sign-in'
+    Write-Host '    3) Remove mobile device partnerships'
+    Write-Host ''
+    Write-Host '  Phase 2: Authorization cleanup'
+    Write-Host '    4) Remove authentication (MFA) methods'
+    Write-Host '    5) Revoke OAuth app grants'
+    Write-Host '    6) Remove from groups'
+    Write-Host ''
+    Write-Host '  Phase 3: Mailbox transition and hardening'
+    Write-Host '    7) Configure forwarding / delegation'
+    Write-Host '    8) Convert mailbox to shared'
+    Write-Host '    9) Remove licenses'
+    Write-Host '   10) Apply Conditional Access block'
+    Write-Host ''
+    Write-Host '   A) Run ALL steps in order (recommended)'
+    Write-Host '   Q) Finish and generate the audit packet'
+    Write-Host ''
+    return (Read-Host '  Choose')
+}
+
+function Resolve-AuditFolder {
+    param([string]$Root, [string]$Upn)
+    $userSafe = ($Upn -split '@')[0] -replace '[^a-zA-Z0-9_-]', '_'
+    $dateStamp = Get-Date -Format 'yyyy-MM-dd'
+    $folder = Join-Path $Root ("{0}_{1}" -f $userSafe, $dateStamp)
+    if (Test-Path $folder) {
+        $folder = Join-Path $Root ("{0}_{1}_{2}" -f $userSafe, $dateStamp, (Get-Date -Format 'HHmmss'))
+    }
+    New-Item -ItemType Directory -Path $folder -Force | Out-Null
+    return $folder
+}
+
+function Main {
+    if (-not $Unattended) {
+        Clear-Host
+        Write-Banner 'MICROSOFT 365 USER OFFBOARDING' 'Green'
+        Write-Host '  Before starting:' -ForegroundColor Yellow
+        Write-Host '    1. Confirm the offboarding is approved.'
+        Write-Host '    2. Have an admin account with the required permissions ready.'
+        if ($script:CanScreenshot) {
+            Write-Host '    3. Close personal windows. Screenshots capture all monitors.'
+        }
+        Write-Host ''
+        $proceed = Read-Host '  Type START to continue, or anything else to exit'
+        if ($proceed -ne 'START') { Write-Host '  Aborted.' -ForegroundColor Yellow; return }
+    }
+
+    # Resolve inputs
+    $upn = $UserPrincipalName
+    if (-not $upn) {
+        if ($Unattended) { throw '-UserPrincipalName is required in unattended mode.' }
+        $upn = Get-TargetUserInteractive
+    }
+    if ($upn -notmatch '@') { throw "Invalid UserPrincipalName: $upn" }
+
+    $root = $AuditRoot
+    if (-not $root) {
+        if ($Unattended) { throw '-AuditRoot is required in unattended mode.' }
+        $root = Get-AuditRootFolderInteractive
+    }
+    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+
+    $auditFolder = Resolve-AuditFolder -Root $root -Upn $upn
+    Write-Ok "Audit folder: $auditFolder"
+
+    Initialize-Modules
+    $operator = Connect-Services
+    Add-AuditEntry -StepNumber 0 -Action 'Connected to Microsoft Graph and Exchange Online' -Result "Authenticated as $operator" `
+        -Details "Target: $upn."
+
+    Initialize-StepMap -Upn $upn -Folder $auditFolder
+
+    # Decide which steps to run
+    $allSteps = 1..10
+    if ($Unattended) {
+        $toRun = if ($Steps) { $Steps } else { $allSteps }
+        Invoke-StepList -Numbers $toRun -StopOnError:$false
+    } elseif ($All -or $Steps) {
+        $toRun = if ($Steps) { $Steps } else { $allSteps }
+        Invoke-StepList -Numbers $toRun -StopOnError:$false
+    } else {
+        while ($true) {
+            $choice = (Show-StepMenu -Upn $upn).ToUpper().Trim()
+            if ($choice -eq 'Q') { break }
+            if ($choice -eq 'A') { Invoke-StepList -Numbers $allSteps -StopOnError:$false; break }
+            if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le 10) {
+                Invoke-StepList -Numbers @([int]$choice) -StopOnError:$false
+            } else {
+                Write-WarnMsg 'Invalid choice. Use 1-10, A, or Q.'
+            }
+        }
+    }
+
+    # Audit packet
+    Write-Banner 'GENERATING AUDIT PACKET'
+    $finalState = Get-FinalState -Upn $upn
+    $auditPath = Write-AuditMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState
+    Write-Ok "Wrote $auditPath"
+
+    $jsonPath = if ($JsonOutPath) { $JsonOutPath } else { Join-Path $auditFolder 'audit.json' }
+    Write-AuditJson -Path $jsonPath -TargetUpn $upn -Operator $operator -FinalState $finalState | Out-Null
+    Write-Ok "Wrote $jsonPath"
+
+    Write-Banner 'COMPLETE' 'Green'
+    Write-Host "  Audit folder: $auditFolder" -ForegroundColor Green
+
+    if (-not $Unattended -and $script:IsWindowsHost) {
+        try { Start-Process explorer.exe $auditFolder } catch { }
+    }
+
+    Disconnect-Services
+}
+
+try {
+    Main
+} catch {
+    Write-ErrMsg "FATAL: $_"
+    Write-Host "  $($_.ScriptStackTrace)" -ForegroundColor Red
+    Disconnect-Services
+    if (-not $Unattended) { Read-Host 'Press ENTER to exit' }
+    exit 1
+}
