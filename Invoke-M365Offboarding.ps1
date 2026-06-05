@@ -287,9 +287,17 @@ function Connect-Services {
         'Group.ReadWrite.All',
         'GroupMember.ReadWrite.All',
         'DelegatedPermissionGrant.ReadWrite.All',
-        'UserAuthenticationMethod.ReadWrite.All',
-        'Sites.ReadWrite.All'
+        'UserAuthenticationMethod.ReadWrite.All'
     )
+
+    # Only request SharePoint write access when an upload could actually occur:
+    # not explicitly skipped, and either a site URL was supplied or we are
+    # interactive (where the end-of-run prompt may choose to upload).
+    $mayUploadToSharePoint = (-not $SkipSharePointUpload) -and ($SharePointSiteUrl -or (-not $Unattended))
+    if ($mayUploadToSharePoint) {
+        $graphScopes += 'Sites.ReadWrite.All'
+        Write-Info 'Requesting the SharePoint (Sites.ReadWrite.All) scope for the audit packet upload.'
+    }
 
     $appOnly = $ClientId -and $CertificateThumbprint -and $TenantId
 

@@ -86,7 +86,7 @@ Step 10 is intentionally last and intentionally separate from disabling the acco
 - The following modules, installed automatically on first run if missing:
   `Microsoft.Graph.Authentication`, `Microsoft.Graph.Users`, `Microsoft.Graph.Users.Actions`, `Microsoft.Graph.Identity.SignIns`, `Microsoft.Graph.Identity.DirectoryManagement`, `Microsoft.Graph.Groups`, `ExchangeOnlineManagement`.
 - An account (interactive) or app registration (unattended) with these Microsoft Graph permissions, plus Exchange Online management rights:
-  `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`, and `Sites.ReadWrite.All` (only needed for the optional SharePoint upload).
+  `User.ReadWrite.All`, `Directory.ReadWrite.All`, `Policy.ReadWrite.ConditionalAccess`, `Application.ReadWrite.All`, `Group.ReadWrite.All`, `GroupMember.ReadWrite.All`, `DelegatedPermissionGrant.ReadWrite.All`, `UserAuthenticationMethod.ReadWrite.All`. The optional SharePoint upload also needs `Sites.ReadWrite.All`, which the tool requests only when an upload may occur (a site URL was supplied, or you run interactively without `-SkipSharePointUpload`). If you never use the upload, that scope is never requested.
 
 ## Usage
 
@@ -149,7 +149,7 @@ The audit packet is meant to live in SharePoint for later review. After the run 
 - **Interactive prompt:** if you do not pass a site URL, the tool asks whether to upload and, if you say yes, prompts for the site URL and folder.
 - **Not linked:** if you decline, pass `-SkipSharePointUpload`, or the upload fails, the packet stays local and the tool tells you exactly which folder to upload to SharePoint manually.
 
-Uploading uses the Microsoft Graph token already established at sign-in and needs the `Sites.ReadWrite.All` permission. If that permission is not consented, skip the upload and move the folder by hand. The offboarding itself never fails because of an upload problem; a failed upload only falls back to the manual-upload message.
+Uploading uses the Microsoft Graph token already established at sign-in and needs the `Sites.ReadWrite.All` permission. That scope is requested at sign-in only when an upload may occur, so a run that never touches SharePoint never asks for it. If the permission is not consented, skip the upload and move the folder by hand. The offboarding itself never fails because of an upload problem; a failed upload only falls back to the manual-upload message.
 
 ## Parameters
 
