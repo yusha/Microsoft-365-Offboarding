@@ -211,12 +211,16 @@ Before onboarding a returning employee (or re-running an offboarding), check whe
 ```powershell
 .\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -AuditRoot C:\Audits
 .\Test-M365Rehire.ps1 -DisplayName "Jane Doe" -AuditRoot C:\Audits -SkipTenantCheck
+.\Test-M365Rehire.ps1 -UserPrincipalName jdoe@contoso.com -SharePointSiteUrl https://contoso.sharepoint.com/sites/IT -SharePointFolderPath "Offboarding Audits"
 ```
 
-It looks for evidence from two sources and prints a verdict:
+It looks for evidence from up to three sources and prints a verdict:
 
-- **Audit history** — scans an audit root for past `audit.json` records and matches by UPN or display name.
-- **Live tenant** — finds matching accounts and flags those that look offboarded (disabled, unlicensed, in the "Offboarded Users" group, or backed by a shared mailbox). Use `-SkipTenantCheck` for a history-only check with no sign-in.
+- **Local audit history** — scans an audit root (`-AuditRoot`) for past `audit.json` records and matches by UPN or display name.
+- **SharePoint audit history** — when `-SharePointSiteUrl` is supplied, scans that site's document library directly over Microsoft Graph, so audit packets that live in SharePoint are found without a local sync. (`-SharePointFolderPath` narrows it to one folder.) This is the durable place to keep audit packets when technicians' machines are disposable. The scan is only performed when a site URL is given.
+- **Live tenant** — finds matching accounts and flags those that look offboarded (disabled, unlicensed, in the "Offboarded Users" group, or backed by a shared mailbox). This source survives even when every local file and the script itself are deleted, because the disabled/unlicensed account and shared mailbox remain in the tenant. Use `-SkipTenantCheck` for a history-only check with no account lookup.
+
+The SharePoint scan needs `Sites.Read.All`, which is requested only when `-SharePointSiteUrl` is supplied.
 
 | Verdict | Meaning |
 |---|---|

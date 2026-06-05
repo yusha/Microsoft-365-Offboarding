@@ -33,7 +33,19 @@
     UPN to match, for example jdoe@contoso.com.
 
 .PARAMETER AuditRoot
-    Folder that holds past offboarding audit packets to scan. Optional.
+    Local (or UNC) folder that holds past offboarding audit packets to scan.
+    Optional.
+
+.PARAMETER SharePointSiteUrl
+    SharePoint site URL whose document library holds past audit packets, for
+    example https://contoso.sharepoint.com/sites/IT. When supplied, the library
+    is scanned directly over Microsoft Graph (no local sync needed). Only used
+    when this is set. Requires a sign-in, so it is ignored together with
+    -SkipTenantCheck unless a connection is made.
+
+.PARAMETER SharePointFolderPath
+    Folder inside the document library to scan, for example "Offboarding Audits".
+    Defaults to the whole library.
 
 .PARAMETER SkipTenantCheck
     Do not connect to Microsoft 365. Only scan the audit history.
@@ -79,6 +91,8 @@ param(
     [string]$DisplayName,
     [string]$UserPrincipalName,
     [string]$AuditRoot,
+    [string]$SharePointSiteUrl,
+    [string]$SharePointFolderPath,
     [switch]$SkipTenantCheck,
     [string]$OffboardedGroupName = 'Offboarded Users',
     [string]$TenantId,
@@ -111,37 +125,105 @@ function Write-Ok      { param([string]$m); Write-Host "  [OK] $m" -ForegroundCo
 function Write-WarnMsg { param([string]$m); Write-Host "  [!]  $m" -ForegroundColor Yellow }
 
 # ================================================================
-# Audit history scan (no sign-in required)
+# Audit record matching (shared by the local and SharePoint scans)
+# ================================================================
+function Get-OffboardingMatch {
+    # Returns a match record if the parsed audit.json is an offboarding record
+    # for the given UPN or display name; otherwise $null.
+    param($Data, [string]$Source, [string]$Path, [string]$Upn, [string]$Name)
+    if ($Data.tool -ne 'Invoke-M365Offboarding') { return $null }
+    $recordUpn  = "$($Data.targetUpn)"
+    $recordName = "$($Data.finalState.'Display name')"
+    $upnMatch  = $Upn  -and $recordUpn  -and ($recordUpn.ToLower()  -eq $Upn.ToLower())
+    $nameMatch = $Name -and $recordName -and ($recordName.ToLower() -eq $Name.ToLower())
+    if (-not ($upnMatch -or $nameMatch)) { return $null }
+    return [PSCustomObject]@{
+        Source      = $Source
+        Path        = $Path
+        Date        = "$($Data.offboardingDate)"
+        Upn         = $recordUpn
+        DisplayName = $recordName
+        PerformedBy = "$($Data.performedBy)"
+        MatchedBy   = if ($upnMatch) { 'upn' } else { 'displayName' }
+    }
+}
+
+# ================================================================
+# Audit history scan (local filesystem, no sign-in required)
 # ================================================================
 function Find-PriorOffboardingRecords {
-    # Scans an audit root for offboarding audit.json files and returns the ones
-    # that match the given UPN or display name.
+    # Scans a local/UNC audit root for offboarding audit.json files that match.
     param([string]$Root, [string]$Upn, [string]$Name)
     $records = @()
     if (-not $Root -or -not (Test-Path $Root)) { return $records }
 
     $jsonFiles = Get-ChildItem -Path $Root -Filter 'audit.json' -Recurse -File -ErrorAction SilentlyContinue
     foreach ($f in $jsonFiles) {
-        try {
-            $data = Get-Content $f.FullName -Raw | ConvertFrom-Json
-        } catch { continue }
-        if ($data.tool -ne 'Invoke-M365Offboarding') { continue }
+        try { $data = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        $m = Get-OffboardingMatch -Data $data -Source 'auditHistory' -Path $f.FullName -Upn $Upn -Name $Name
+        if ($m) { $records += $m }
+    }
+    return $records
+}
 
-        $recordUpn = "$($data.targetUpn)"
-        $recordName = "$($data.finalState.'Display name')"
-        $upnMatch  = $Upn  -and $recordUpn  -and ($recordUpn.ToLower()  -eq $Upn.ToLower())
-        $nameMatch = $Name -and $recordName -and ($recordName.ToLower() -eq $Name.ToLower())
-        if ($upnMatch -or $nameMatch) {
-            $records += [PSCustomObject]@{
-                Source      = 'auditHistory'
-                Path        = $f.FullName
-                Date        = "$($data.offboardingDate)"
-                Upn         = $recordUpn
-                DisplayName = $recordName
-                PerformedBy = "$($data.performedBy)"
-                MatchedBy   = if ($upnMatch) { 'upn' } else { 'displayName' }
-            }
+# ================================================================
+# Audit history scan (SharePoint document library over Graph)
+# ================================================================
+function Invoke-GraphGetAll {
+    # GET with @odata.nextLink paging; returns the combined .value items.
+    param([string]$Uri)
+    $items = @()
+    $next = $Uri
+    while ($next) {
+        $resp = Invoke-MgGraphRequest -Method GET -Uri $next -OutputType PSObject
+        if ($resp.value) { $items += $resp.value }
+        $next = $resp.'@odata.nextLink'
+    }
+    return $items
+}
+
+function Find-PriorOffboardingRecordsSharePoint {
+    # Resolves the site's default document library and searches it for audit.json
+    # files, then matches them like the local scan. Used only when a site URL is
+    # supplied. When checking by UPN, only audit.json files under a folder whose
+    # name matches the user's folder prefix are downloaded, to limit reads.
+    param([string]$SiteUrl, [string]$FolderPath, [string]$Upn, [string]$Name)
+    $records = @()
+
+    $uri = [Uri]$SiteUrl
+    $h = $uri.Host
+    $rel = $uri.AbsolutePath.TrimEnd('/')
+    $siteAddr = if ([string]::IsNullOrWhiteSpace($rel) -or $rel -eq '/') { $h } else { "$h`:$rel" }
+    $site = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$siteAddr" -OutputType PSObject
+    if (-not $site.id) { throw "Could not resolve SharePoint site '$SiteUrl'." }
+    $drive = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/sites/$($site.id)/drive" -OutputType PSObject
+    $driveId = $drive.id
+
+    $searchUri = if ([string]::IsNullOrWhiteSpace($FolderPath)) {
+        "https://graph.microsoft.com/v1.0/drives/$driveId/root/search(q='audit.json')"
+    } else {
+        $enc = ($FolderPath.Trim('/').Split('/') | Where-Object { $_ } | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
+        "https://graph.microsoft.com/v1.0/drives/$driveId/root:/$enc`:/search(q='audit.json')"
+    }
+
+    # Optional folder-name prefix filter when checking by UPN (folders are named <userprefix>_<date>).
+    $folderPrefix = $null
+    if ($Upn) { $folderPrefix = (($Upn -split '@')[0] -replace '[^a-zA-Z0-9_-]', '_') + '_' }
+
+    $items = @(Invoke-GraphGetAll -Uri $searchUri | Where-Object { $_.name -eq 'audit.json' -and $_.file })
+    foreach ($it in $items) {
+        if ($folderPrefix -and -not $Name) {
+            $parentName = "$($it.parentReference.name)"
+            if ($parentName -and ($parentName.ToLower() -notlike ($folderPrefix.ToLower() + '*'))) { continue }
         }
+        $tmp = [System.IO.Path]::GetTempFileName()
+        try {
+            Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/drives/$driveId/items/$($it.id)/content" -OutputFilePath $tmp | Out-Null
+            $data = Get-Content $tmp -Raw | ConvertFrom-Json
+        } catch { continue } finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        $path = if ($it.webUrl) { "$($it.webUrl)" } else { "$($it.name)" }
+        $m = Get-OffboardingMatch -Data $data -Source 'sharePoint' -Path $path -Upn $Upn -Name $Name
+        if ($m) { $records += $m }
     }
     return $records
 }
@@ -150,7 +232,9 @@ function Find-PriorOffboardingRecords {
 # Tenant connection (read-only)
 # ================================================================
 function Connect-ReadOnly {
+    param([bool]$IncludeSharePoint, [bool]$IncludeExchange)
     $scopes = @('User.Read.All', 'Directory.Read.All', 'Group.Read.All', 'GroupMember.Read.All')
+    if ($IncludeSharePoint) { $scopes += 'Sites.Read.All' }
     $appOnly = $ClientId -and $CertificateThumbprint -and $TenantId
     Write-Action 'Connecting to Microsoft Graph (read-only)...'
     if ($appOnly) {
@@ -160,6 +244,8 @@ function Connect-ReadOnly {
     }
     $ctx = Get-MgContext
     Write-Ok "Connected as $(if ($ctx.Account) { $ctx.Account } else { $ctx.AppName })"
+
+    if (-not $IncludeExchange) { return $false }
 
     # Exchange Online is only needed for the shared-mailbox signal; degrade if it fails.
     try {
@@ -319,36 +405,59 @@ function Main {
         if (-not $DisplayName -and -not $UserPrincipalName) { throw 'Nothing to check.' }
     }
 
-    Write-Banner 'CHECKING AUDIT HISTORY'
+    Write-Banner 'CHECKING LOCAL AUDIT HISTORY'
     $history = @(Find-PriorOffboardingRecords -Root $AuditRoot -Upn $UserPrincipalName -Name $DisplayName)
     if ($history.Count) {
-        Write-WarnMsg "Found $($history.Count) prior offboarding record(s):"
-        foreach ($h in $history) { Write-Info "  $($h.Date)  $($h.Upn)  (matched by $($h.MatchedBy))  -  $($h.Path)" }
+        Write-WarnMsg "Found $($history.Count) record(s) in the local audit history:"
+        foreach ($h in $history) { Write-Info "  $($h.Date)  $($h.Upn)  (by $($h.MatchedBy))  -  $($h.Path)" }
+    } elseif ($AuditRoot) {
+        Write-Info 'No matching records in the local audit history.'
     } else {
-        Write-Info 'No matching offboarding records in the audit history.'
+        Write-Info 'No local audit root supplied (-AuditRoot).'
     }
 
     $tenant = @()
-    if (-not $SkipTenantCheck) {
-        Write-Banner 'CHECKING THE TENANT'
-        $haveExchange = Connect-ReadOnly
+    $needGraph = (-not $SkipTenantCheck) -or $SharePointSiteUrl
+    if ($needGraph) {
+        $haveExchange = Connect-ReadOnly -IncludeSharePoint:([bool]$SharePointSiteUrl) -IncludeExchange:(-not $SkipTenantCheck)
         try {
-            $groupId = Get-OffboardedGroupId -Name $OffboardedGroupName
-            $tenant = @(Find-TenantAccounts -Upn $UserPrincipalName -Name $DisplayName -GroupId $groupId -HaveExchange $haveExchange)
-            if ($tenant.Count) {
-                foreach ($t in $tenant) {
-                    $flag = if ($t.LooksOffboarded) { 'LOOKS OFFBOARDED' } else { 'active' }
-                    $mbxText = if ($t.MailboxType) { $t.MailboxType } else { 'n/a' }
-                    Write-Info ("  {0}  enabled={1} licenses={2} group={3} mailbox={4}  [{5}]" -f $t.Upn, $t.AccountEnabled, $t.LicenseCount, $t.InOffboardedGroup, $mbxText, $flag)
+            # SharePoint audit history (only when a site is linked).
+            if ($SharePointSiteUrl) {
+                Write-Banner 'CHECKING SHAREPOINT AUDIT HISTORY'
+                try {
+                    $sp = @(Find-PriorOffboardingRecordsSharePoint -SiteUrl $SharePointSiteUrl -FolderPath $SharePointFolderPath -Upn $UserPrincipalName -Name $DisplayName)
+                    if ($sp.Count) {
+                        Write-WarnMsg "Found $($sp.Count) record(s) in the SharePoint library:"
+                        foreach ($h in $sp) { Write-Info "  $($h.Date)  $($h.Upn)  (by $($h.MatchedBy))  -  $($h.Path)" }
+                    } else {
+                        Write-Info 'No matching records in the SharePoint library.'
+                    }
+                    $history += $sp
+                } catch {
+                    Write-WarnMsg "SharePoint scan failed: $_"
                 }
-            } else {
-                Write-Info 'No matching accounts found in the tenant.'
+            }
+
+            # Live tenant signals (unless skipped).
+            if (-not $SkipTenantCheck) {
+                Write-Banner 'CHECKING THE TENANT'
+                $groupId = Get-OffboardedGroupId -Name $OffboardedGroupName
+                $tenant = @(Find-TenantAccounts -Upn $UserPrincipalName -Name $DisplayName -GroupId $groupId -HaveExchange $haveExchange)
+                if ($tenant.Count) {
+                    foreach ($t in $tenant) {
+                        $flag = if ($t.LooksOffboarded) { 'LOOKS OFFBOARDED' } else { 'active' }
+                        $mbxText = if ($t.MailboxType) { $t.MailboxType } else { 'n/a' }
+                        Write-Info ("  {0}  enabled={1} licenses={2} group={3} mailbox={4}  [{5}]" -f $t.Upn, $t.AccountEnabled, $t.LicenseCount, $t.InOffboardedGroup, $mbxText, $flag)
+                    }
+                } else {
+                    Write-Info 'No matching accounts found in the tenant.'
+                }
             }
         } finally {
             Disconnect-ReadOnly
         }
     } else {
-        Write-Info 'Tenant check skipped (-SkipTenantCheck).'
+        Write-Info 'Tenant and SharePoint checks skipped.'
     }
 
     $verdict = Get-RehireVerdict -HistoryMatches $history -TenantMatches $tenant
