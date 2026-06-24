@@ -316,6 +316,7 @@ function Connect-Services {
     $graphScopes = @(
         'User.ReadWrite.All',
         'User-PasswordProfile.ReadWrite.All',  # Step 1 password reset: passwordProfile updates require this dedicated scope; User.ReadWrite.All alone returns 403 Authorization_RequestDenied.
+        'RoleManagement.ReadWrite.Directory',  # Pre-step: remove the target's admin role assignments (a privileged account cannot be disabled/managed until its roles are removed).
         'Directory.ReadWrite.All',
         'Policy.ReadWrite.ConditionalAccess',
         'Application.ReadWrite.All',
@@ -1421,6 +1422,8 @@ function Show-StepMenu {
     Write-Host '  Target user: ' -NoNewline; Write-Host $Upn -ForegroundColor Yellow
     Write-Host ('=' * 64) -ForegroundColor Cyan
     Write-Credit
+    Write-Host '  Run as a Global Administrator. Any admin roles on the target are' -ForegroundColor DarkGray
+    Write-Host '  removed automatically before the steps below.' -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  Phase 1: Immediate lockout'
     Write-Host '    1) Reset password and revoke sessions'
@@ -1473,6 +1476,67 @@ function Test-PriorOffboarding {
     return $hits
 }
 
+# ----------------------------------------------------------------
+# Pre-step: strip the target's administrative role assignments.
+# A user who holds a privileged Entra role is protected: even a Global
+# Administrator cannot disable or fully manage the account until the roles are
+# removed (this is why disabling an admin returns 403 Authorization_RequestDenied).
+# Removing roles is also correct offboarding hygiene for a departing admin.
+# Uses the REST endpoint via Invoke-MgGraphRequest to stay independent of
+# Graph PowerShell cmdlet-name changes across SDK versions.
+# ----------------------------------------------------------------
+function Remove-AdminRoleAssignments {
+    param([string]$Upn)
+    Write-Banner 'PRE-STEP: ADMINISTRATIVE ROLE CHECK'
+
+    # Read the role memberships under a guard: this runs in Main (outside the
+    # per-step try/catch), so an unhandled error here would abort the whole run.
+    try {
+        $user = Get-MgUser -UserId $Upn -Property Id -ErrorAction Stop
+        $memberships = @(Get-MgUserMemberOf -UserId $user.Id -All -ErrorAction Stop)
+    } catch {
+        Write-WarnMsg "Could not read role memberships: $_"
+        Write-WarnMsg 'Admin roles were NOT verified or removed; later steps may fail if this user is an admin.'
+        Add-AuditEntry -StepNumber 0 -Action 'Administrative role check' -Result 'FAILED: could not read role memberships' `
+            -Details "Could not read directory role memberships: $($_.Exception.Message). Admin roles were NOT verified or removed."
+        return
+    }
+
+    $roles = @($memberships | Where-Object { $_.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.directoryRole' })
+
+    if (-not $roles) {
+        Write-Info 'User holds no directly-assigned active directory roles.'
+        Write-Info 'Note: PIM-eligible (not activated) and role-assignable-group-derived roles are not covered here.'
+        Add-AuditEntry -StepNumber 0 -Action 'Administrative role check' -Result 'Success' `
+            -Details 'User held no directly-assigned active directory roles. (PIM-eligible and role-assignable-group-derived roles are not covered by this check.)'
+        return
+    }
+
+    Write-WarnMsg "User is an administrator: $($roles.Count) directly-assigned role(s). Removing before offboarding."
+    $removed = @(); $failures = 0
+    foreach ($r in $roles) {
+        $roleName = $r.AdditionalProperties.displayName
+        if (-not $PSCmdlet.ShouldProcess($Upn, "Remove directory role '$roleName'")) { continue }
+        try {
+            $uri = "https://graph.microsoft.com/v1.0/directoryRoles/$($r.Id)/members/$($user.Id)/`$ref"
+            Invoke-MgGraphRequest -Method DELETE -Uri $uri -ErrorAction Stop | Out-Null
+            Write-Ok "Removed role: $roleName"
+            $removed += "$roleName [$($r.Id)]"
+        } catch {
+            $failures++
+            Write-WarnMsg "Could not remove role '$roleName': $_ (note: the last Global Administrator cannot be removed; assign a replacement first.)"
+        }
+    }
+
+    $result = if ($failures -gt 0) { "FAILED: $failures of $($roles.Count) role removal(s) failed" } else { 'Success' }
+    $details = if ($removed.Count) {
+        "Removed directly-assigned roles (name [id]): $($removed -join '; '). PIM-eligible and role-assignable-group-derived roles are NOT covered, and the reversal does not re-grant roles."
+    } else {
+        "Found $($roles.Count) role(s) but none could be removed (see warnings); the account may remain privileged."
+    }
+    Add-AuditEntry -StepNumber 0 -Action "Removed $($removed.Count) of $($roles.Count) administrative role assignment(s)" -Result $result -Details $details
+}
+
 function Main {
     Initialize-ScreenshotCapability
 
@@ -1491,7 +1555,9 @@ function Main {
             Write-Credit
             Write-Host '  Before starting:' -ForegroundColor Yellow
             Write-Host '    1. Confirm the offboarding is approved.'
-            Write-Host '    2. Have an admin account with the required permissions ready.'
+            Write-Host '    2. Sign in as a Global Administrator (required to manage admins,'
+            Write-Host '       Conditional Access, and to remove the user''s admin roles).'
+            Write-Host '    Note: any admin roles on the target are removed automatically first.'
             if ($script:ScreenshotMode -eq 'windows') {
                 Write-Host '    3. Close personal windows. Screenshots capture all monitors.'
             }
@@ -1590,16 +1656,20 @@ function Main {
         Add-AuditEntry -StepNumber 0 -Action 'Connected to Microsoft Graph and Exchange Online' -Result "Authenticated as $operator" `
             -Details "Target: $upn."
 
-        # Decide which steps to run
+        # Decide which steps to run. Admin roles are stripped first, but only when a
+        # step that disables/manages the account (1 or 2) will actually run -- a
+        # targeted subset like -Steps 7 must NOT silently revoke the user's roles.
         if ($Unattended -or $All -or $Steps) {
             $toRun = if ($Steps) { $Steps } else { $allSteps }
+            if ($toRun -contains 1 -or $toRun -contains 2) { Remove-AdminRoleAssignments -Upn $upn }
             Invoke-StepList -Numbers $toRun -Upn $upn -Folder $auditFolder -StopOnError:$false
         } else {
             while ($true) {
                 $choice = (Show-StepMenu -Upn $upn).ToUpper().Trim()
                 if ($choice -eq 'Q') { break }
-                if ($choice -eq 'A') { Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false; break }
+                if ($choice -eq 'A') { Remove-AdminRoleAssignments -Upn $upn; Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false; break }
                 if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le 10) {
+                    if ([int]$choice -eq 1 -or [int]$choice -eq 2) { Remove-AdminRoleAssignments -Upn $upn }
                     Invoke-StepList -Numbers @([int]$choice) -Upn $upn -Folder $auditFolder -StopOnError:$false
                 } else {
                     Write-WarnMsg 'Invalid choice. Use 1-10, A, or Q.'

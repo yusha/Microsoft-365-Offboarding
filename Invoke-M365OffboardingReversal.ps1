@@ -704,7 +704,8 @@ function Main {
     $notRestored = @(
         'Authentication (MFA) methods: the user must re-register them at https://aka.ms/mfasetup.',
         'Mobile device (ActiveSync) partnerships: the device re-creates the partnership on next connect.',
-        'OAuth app grants: the user re-consents to apps on next use.'
+        'OAuth app grants: the user re-consents to apps on next use.',
+        'Administrative (directory) role assignments: re-assign any required roles manually (offboarding removes them; the role names are listed in the offboarding audit packet).'
     )
     $finalState = Get-FinalState -Upn $upn
     $md = Write-ReversalMarkdown -OutputFolder $auditFolder -TargetUpn $upn -Operator $operator -FinalState $finalState -NotRestored $notRestored
