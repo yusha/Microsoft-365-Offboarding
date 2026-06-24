@@ -258,6 +258,18 @@ function Connect-Services {
     $operatorId = if ($ctx.Account) { $ctx.Account } else { $ctx.AppName }
     Write-Ok "Connected to Graph as $operatorId in tenant $($ctx.TenantId)"
 
+    # Verify the delegated token carries every scope the reversal needs; surface any
+    # gap here with the exact names instead of failing partway through a restore.
+    if (-not $appOnly -and $ctx.Scopes) {
+        $missingScopes = @($graphScopes | Where-Object { $_ -notin $ctx.Scopes })
+        if ($missingScopes.Count) {
+            Write-WarnMsg ("These Microsoft Graph scopes are MISSING from the token: {0}." -f ($missingScopes -join ', '))
+            Write-WarnMsg 'Restore steps that need them will fail. Grant admin consent or re-run Connect-MgGraph with the full scope list and accept the consent, then run again.'
+        } else {
+            Write-Ok 'All required Microsoft Graph scopes are present in the token.'
+        }
+    }
+
     Write-Action 'Connecting to Exchange Online...'
     if ($appOnly) {
         if (-not $Organization) { throw 'App-only Exchange Online auth requires -Organization.' }
