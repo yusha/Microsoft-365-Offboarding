@@ -352,15 +352,28 @@ function Connect-Services {
     $operatorId = if ($ctx.Account) { $ctx.Account } else { $ctx.AppName }
     Write-Ok "Connected to Graph as $operatorId in tenant $($ctx.TenantId)"
 
-    # Verify the delegated token actually carries every scope we need. Admin-restricted
-    # scopes (e.g. Policy.ReadWrite.ConditionalAccess) sometimes fail to land in the
-    # token; catch that here at step 0 with the exact names instead of failing mid-run.
+    # Verify the delegated token carries every scope we need, and obtain consent for
+    # any that are missing without the operator touching the Entra portal. Admin-
+    # restricted scopes (e.g. Policy.ReadWrite.ConditionalAccess) are only granted when
+    # an admin consents on behalf of the organization, so if one is absent we re-prompt
+    # right here and tell the operator to tick that box -- they just accept the dialog.
     if (-not $appOnly -and $ctx.Scopes) {
         $missingScopes = @($graphScopes | Where-Object { $_ -notin $ctx.Scopes })
         if ($missingScopes.Count) {
-            Write-WarnMsg ("These Microsoft Graph scopes are MISSING from the token: {0}." -f ($missingScopes -join ', '))
-            Write-WarnMsg 'Steps that need them will fail (for example, step 10 needs Policy.ReadWrite.ConditionalAccess).'
-            Write-WarnMsg 'Fix: grant admin consent to "Microsoft Graph Command Line Tools", or re-run Connect-MgGraph with the full scope list and accept the consent, then run again.'
+            Write-WarnMsg ("The token is missing these scopes: {0}." -f ($missingScopes -join ', '))
+            Write-Action 'Opening a consent window for them. Accept it, and TICK "Consent on behalf of your organization" so admin-restricted permissions are granted.'
+            try {
+                Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+                Connect-MgGraph -Scopes $graphScopes -NoWelcome
+                $ctx = Get-MgContext
+            } catch {
+                Write-WarnMsg "Consent prompt failed: $_"
+            }
+            $missingScopes = @($graphScopes | Where-Object { $_ -notin $ctx.Scopes })
+        }
+        if ($missingScopes.Count) {
+            Write-WarnMsg ("Still missing after the consent prompt: {0}." -f ($missingScopes -join ', '))
+            Write-WarnMsg 'The core offboarding still runs; steps needing these scopes are skipped with guidance (for example, step 10 Conditional Access).'
         } else {
             Write-Ok 'All required Microsoft Graph scopes are present in the token.'
         }
@@ -1192,31 +1205,50 @@ function Invoke-Step10 {
         else { throw }
     }
 
-    $policyNameFilter = $BlockPolicyName -replace "'", "''"
-    Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
-    $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $policy) {
-        Write-WarnMsg "Policy not found. Creating in REPORT-ONLY mode. An admin must enable it."
-        $policyBody = @{
-            displayName   = $BlockPolicyName
-            state         = 'enabledForReportingButNotEnforced'
-            conditions    = @{
-                applications = @{ includeApplications = @('All') }
-                users        = @{ includeGroups = @($group.Id) }
+    # The Conditional Access policy is optional, report-only defense-in-depth (an admin
+    # must enable it before it enforces anything). The group membership above is the
+    # actual mechanism and already succeeded, so if the CA policy can't be created --
+    # most often a missing Policy.ReadWrite.ConditionalAccess consent -- record a clear
+    # warning instead of a failure that tanks an otherwise-complete offboarding.
+    $policyOk = $true
+    $policyNote = ''
+    try {
+        $policyNameFilter = $BlockPolicyName -replace "'", "''"
+        Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
+        $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $policy) {
+            Write-WarnMsg "Policy not found. Creating in REPORT-ONLY mode. An admin must enable it."
+            $policyBody = @{
+                displayName   = $BlockPolicyName
+                state         = 'enabledForReportingButNotEnforced'
+                conditions    = @{
+                    applications = @{ includeApplications = @('All') }
+                    users        = @{ includeGroups = @($group.Id) }
+                }
+                grantControls = @{ operator = 'OR'; builtInControls = @('block') }
             }
-            grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+            $policy = New-MgIdentityConditionalAccessPolicy -BodyParameter $policyBody -ErrorAction Stop
+            Write-Ok "Created CA policy in report-only mode (Id: $($policy.Id))"
+            Write-WarnMsg 'ACTION REQUIRED: enable this policy in the Entra admin center after review.'
+        } else {
+            Write-Ok "Found CA policy '$BlockPolicyName' (state: $($policy.State))"
         }
-        $policy = New-MgIdentityConditionalAccessPolicy -BodyParameter $policyBody
-        Write-Ok "Created CA policy in report-only mode (Id: $($policy.Id))"
-        Write-WarnMsg 'ACTION REQUIRED: enable this policy in the Entra admin center after review.'
-    } else {
-        Write-Ok "Found CA policy '$BlockPolicyName' (state: $($policy.State))"
+        $policyNote = "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
+    } catch {
+        $policyOk = $false
+        Write-ErrMsg "Conditional Access policy was not created: $_"
+        if ("$_" -match 'scopes are missing|AccessDenied|Authorization_RequestDenied|Forbidden|Insufficient privileges') {
+            Write-WarnMsg "This needs Policy.ReadWrite.ConditionalAccess. Sign in again and consent on behalf of the organization, then re-run with -Steps 10."
+            $policyNote = "CA policy NOT created: the Policy.ReadWrite.ConditionalAccess permission is missing/denied. The user is already in '$OffboardedGroupName'; this report-only policy is defense-in-depth and is NOT required for the lockout. Grant the consent (sign in again and consent for the organization) or create the policy manually targeting the group, then run -Steps 10."
+        } else {
+            $policyNote = "CA policy NOT created ($_). The user is already in '$OffboardedGroupName'; create or enable the block policy manually."
+        }
     }
 
-    $details = "Group '$OffboardedGroupName' (Id: $($group.Id)): user added.`n" +
-               "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
+    $details = "Group '$OffboardedGroupName' (Id: $($group.Id)): user added.`n$policyNote"
+    $result = if ($policyOk) { 'Success' } else { 'Completed with warning: CA policy not created' }
     $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 10 -Label 'conditional_access_applied'
-    Add-AuditEntry -StepNumber 10 -Action "Added user to '$OffboardedGroupName' (targeted by CA block)" -Result 'Success' -Screenshot $shot -Details $details
+    Add-AuditEntry -StepNumber 10 -Action "Added user to '$OffboardedGroupName' (targeted by CA block)" -Result $result -Screenshot $shot -Details $details
 }
 
 # ================================================================
