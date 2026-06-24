@@ -228,6 +228,25 @@ function Write-WarnMsg { param([string]$m); Write-Host "  [!]  $m" -ForegroundCo
 function Write-ErrMsg  { param([string]$m); Write-Host "  [X]  $m" -ForegroundColor Red }
 function Write-Credit  { Write-Host '  Developed by Yusha  |  https://yusha.ca' -ForegroundColor DarkCyan }
 
+function Wait-ForCondition {
+    # Poll $Check until it returns truthy or $TimeoutSeconds elapses. Microsoft 365
+    # writes (account disable, mailbox conversion, license removal) replicate
+    # asynchronously, so a single fixed sleep + read can falsely report failure
+    # while the change is still propagating. Returns $true if satisfied in time.
+    param(
+        [Parameter(Mandatory)][scriptblock]$Check,
+        [int]$TimeoutSeconds = 60,
+        [int]$IntervalSeconds = 3
+    )
+    $script:WaitLastError = $null
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try { if (& $Check) { return $true } } catch { $script:WaitLastError = $_ }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+}
+
 # ================================================================
 # SECTION 2: Inputs (interactive only)
 # ================================================================
@@ -475,7 +494,10 @@ function Save-Screenshot {
     $path = Join-Path $OutputFolder $fname
 
     try {
-        Start-Sleep -Milliseconds 400
+        # Let the terminal finish painting the step's output before the screen grab.
+        # Windows Terminal renders asynchronously, so too short a wait captures the
+        # PREVIOUS step's frame (the screenshot ends up one step behind its filename).
+        Start-Sleep -Milliseconds 1000
         if ($script:ScreenshotMode -eq 'windows') {
             Save-ScreenshotWindows -Path $path
         } else {
@@ -777,9 +799,8 @@ function Invoke-Step2 {
 
     if ($PSCmdlet.ShouldProcess($Upn, 'Set AccountEnabled = false')) {
         Update-MgUser -UserId $Upn -AccountEnabled:$false
-        Start-Sleep -Seconds 2
-        $user = Get-MgUser -UserId $Upn -Property AccountEnabled
-        if ($user.AccountEnabled) { throw 'Failed to disable account. AccountEnabled is still true.' }
+        $confirmed = Wait-ForCondition -Check { -not (Get-MgUser -UserId $Upn -Property AccountEnabled).AccountEnabled }
+        if (-not $confirmed) { throw 'Failed to disable account. AccountEnabled is still true after 60s.' }
         Write-Ok 'Account is now disabled (AccountEnabled = false)'
     }
 
@@ -913,7 +934,7 @@ function Invoke-Step6 {
     $editableGroups = @()
     foreach ($g in $groups) {
         if ($g.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group') {
-            $grp = Get-MgGroup -GroupId $g.Id -ErrorAction SilentlyContinue
+            $grp = Get-MgGroup -GroupId $g.Id -Property Id, DisplayName, Mail, MailEnabled, GroupTypes, OnPremisesSyncEnabled -ErrorAction SilentlyContinue
             if ($grp -and -not $grp.OnPremisesSyncEnabled) {
                 $editableGroups += $grp
             } elseif ($grp -and $grp.OnPremisesSyncEnabled) {
@@ -925,29 +946,75 @@ function Invoke-Step6 {
     Write-Info "Found $($editableGroups.Count) cloud-managed group(s)."
     $details = "Group memberships: $($groups.Count) total, $($editableGroups.Count) cloud-managed.`n"
 
-    $failures = 0
+    $removed = 0; $skipped = 0; $failures = 0
     foreach ($g in $editableGroups) {
         if (-not $PSCmdlet.ShouldProcess($g.DisplayName, 'Remove group membership')) { continue }
+
+        # Dynamic-membership groups are populated by a rule; members cannot be
+        # removed manually. Skip them with a note (not removed, not a failure).
+        if ($g.GroupTypes -contains 'DynamicMembership') {
+            Write-WarnMsg "Skipping '$($g.DisplayName)': dynamic membership (managed by rule, cannot remove directly)."
+            $details += "  Skipped: $($g.DisplayName) ($($g.Id)) - dynamic membership group`n"
+            $skipped++
+            continue
+        }
+
+        # Distribution lists and mail-enabled security groups cannot be modified
+        # through Microsoft Graph (Remove-MgGroupMemberByRef returns "Cannot Update
+        # a mail-enabled security groups and or distribution list"); they must be
+        # managed through Exchange Online. Microsoft 365 (Unified) groups stay on Graph.
+        $isExchangeManaged = $g.MailEnabled -and ($g.GroupTypes -notcontains 'Unified')
+
         try {
-            Remove-MgGroupMemberByRef -GroupId $g.Id -DirectoryObjectId $user.Id -ErrorAction Stop
-            Write-Ok "Removed from: $($g.DisplayName)"
-            $details += "  Removed from: $($g.DisplayName) ($($g.Id))`n"
+            if ($isExchangeManaged) {
+                # Prefer the primary SMTP; fall back to the object Id (unambiguous),
+                # never the non-unique display name.
+                $ident = if ($g.Mail) { $g.Mail } else { $g.Id }
+                Remove-DistributionGroupMember -Identity $ident -Member $Upn -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
+                Write-Ok "Removed from: $($g.DisplayName) (via Exchange)"
+                $details += "  Removed from: $($g.DisplayName) ($($g.Id)) [Exchange distribution / mail-enabled]`n"
+            } else {
+                Remove-MgGroupMemberByRef -GroupId $g.Id -DirectoryObjectId $user.Id -ErrorAction Stop
+                Write-Ok "Removed from: $($g.DisplayName)"
+                $details += "  Removed from: $($g.DisplayName) ($($g.Id))`n"
+            }
+            $removed++
         } catch {
-            $failures++
-            Write-WarnMsg "Could not remove from '$($g.DisplayName)': $_"
-            $details += "  Failed: $($g.DisplayName) - $_`n"
+            # "Already not a member" is the desired end state, not a failure (matters
+            # when Step 6 is re-run after a partial run).
+            if ("$_" -match "isn't a member|not a member|does not exist|Request_ResourceNotFound|ManagementObjectNotFound|couldn't be found") {
+                Write-Info "Already not a member of '$($g.DisplayName)'."
+                $details += "  Already removed: $($g.DisplayName) ($($g.Id))`n"
+                $removed++
+            } else {
+                $failures++
+                Write-WarnMsg "Could not remove from '$($g.DisplayName)': $_"
+                $details += "  Failed: $($g.DisplayName) - $_`n"
+            }
         }
     }
 
-    $result = if ($failures -gt 0) { "Completed with $failures failure(s)" } else { 'Success' }
+    $resultParts = @()
+    if ($failures -gt 0) { $resultParts += "$failures failure(s)" }
+    if ($skipped -gt 0)  { $resultParts += "$skipped skipped" }
+    $result = if ($resultParts.Count) { "Completed with $($resultParts -join ', ')" } else { 'Success' }
     $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 6 -Label 'groups_removed'
-    Add-AuditEntry -StepNumber 6 -Action "Removed user from $($editableGroups.Count) cloud-managed group(s)" -Result $result -Screenshot $shot -Details $details
+    Add-AuditEntry -StepNumber 6 -Action "Removed user from $removed of $($editableGroups.Count) cloud-managed group(s)" -Result $result -Screenshot $shot -Details $details
 }
 
 # ---------- Step 7: Forwarding / delegation (optional) ----------
 function Invoke-Step7 {
     param([string]$Upn, [string]$Folder)
     Write-StepHeader 7 'Configure forwarding and delegation (optional)'
+
+    # Forwarding and delegation act on the mailbox; a user with no Exchange Online
+    # mailbox (unlicensed / service account) has nothing to configure here.
+    if (-not (Get-Mailbox -Identity $Upn -ErrorAction SilentlyContinue)) {
+        Write-WarnMsg 'No Exchange Online mailbox for this user. Skipping forwarding/delegation.'
+        $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 7 -Label 'forwarding_delegation'
+        Add-AuditEntry -StepNumber 7 -Action 'Configure forwarding / delegation' -Result 'Skipped' -Screenshot $shot -Details 'No Exchange Online mailbox found; forwarding/delegation not applicable.'
+        return
+    }
 
     $fwdTarget = $ForwardingAddress
     $delTarget = $DelegateTo
@@ -999,16 +1066,33 @@ function Invoke-Step8 {
         return
     }
 
+    $mbx = Get-Mailbox -Identity $Upn -ErrorAction SilentlyContinue
+    if (-not $mbx) {
+        Write-WarnMsg 'No Exchange Online mailbox for this user. Skipping conversion to shared.'
+        $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 8 -Label 'mailbox_converted_to_shared'
+        Add-AuditEntry -StepNumber 8 -Action 'Convert mailbox to shared' -Result 'Skipped' -Screenshot $shot -Details 'No Exchange Online mailbox found; nothing to convert.'
+        return
+    }
+    if ($mbx.RecipientTypeDetails -eq 'SharedMailbox') {
+        Write-Info 'Mailbox is already a shared mailbox. Nothing to convert.'
+        $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 8 -Label 'mailbox_converted_to_shared'
+        Add-AuditEntry -StepNumber 8 -Action 'Convert mailbox to shared' -Result 'Skipped' -Screenshot $shot -Details 'Mailbox was already a SharedMailbox.'
+        return
+    }
+
     Write-Info 'The license must still be assigned for this to work (Microsoft hides'
     Write-Info 'the convert option once the license is removed). License removal is the'
     Write-Info 'next step, not this one.'
 
     if ($PSCmdlet.ShouldProcess($Upn, 'Convert to shared mailbox')) {
         Set-Mailbox -Identity $Upn -Type Shared
-        Start-Sleep -Seconds 3
-        $mbx = Get-Mailbox -Identity $Upn
-        if ($mbx.RecipientTypeDetails -ne 'SharedMailbox') {
-            throw "Conversion failed. RecipientTypeDetails is still '$($mbx.RecipientTypeDetails)'."
+        # Exchange applies the conversion asynchronously and it can take a minute or
+        # more to surface, so poll rather than reading once after a fixed 3s wait.
+        Write-Action 'Waiting for Exchange to confirm the conversion (up to 2 minutes)...'
+        $confirmed = Wait-ForCondition -TimeoutSeconds 120 -IntervalSeconds 5 -Check { (Get-Mailbox -Identity $Upn).RecipientTypeDetails -eq 'SharedMailbox' }
+        if (-not $confirmed) {
+            $current = (Get-Mailbox -Identity $Upn -ErrorAction SilentlyContinue).RecipientTypeDetails
+            throw ("Conversion not confirmed within 120s. RecipientTypeDetails is still '$current'." + $(if ($script:WaitLastError) { " Last check error: $($script:WaitLastError)" }))
         }
         Write-Ok 'Conversion confirmed. RecipientTypeDetails = SharedMailbox'
     }
@@ -1035,12 +1119,17 @@ function Invoke-Step9 {
         Write-Info "Removing $($skuIds.Count) license SKU(s)."
         if ($PSCmdlet.ShouldProcess($Upn, "Remove $($skuIds.Count) license(s)")) {
             Set-MgUserLicense -UserId $user.Id -AddLicenses @() -RemoveLicenses $skuIds | Out-Null
-            Start-Sleep -Seconds 2
-            $check = Get-MgUser -UserId $Upn -Property AssignedLicenses
-            if ($check.AssignedLicenses.Count -gt 0) {
-                throw "License removal incomplete. $($check.AssignedLicenses.Count) licenses still assigned."
+            # Set-MgUserLicense removes only directly-assigned licenses; group-based
+            # (inherited) licenses cannot be removed at the user level, so verify that
+            # no DIRECTLY-assigned licenses remain rather than requiring a zero total.
+            $confirmed = Wait-ForCondition -Check {
+                @((Get-MgUser -UserId $Upn -Property LicenseAssignmentStates).LicenseAssignmentStates | Where-Object { -not $_.AssignedByGroup }).Count -eq 0
             }
-            Write-Ok 'All licenses removed and verified.'
+            if (-not $confirmed) {
+                $directLeft = @((Get-MgUser -UserId $Upn -Property LicenseAssignmentStates).LicenseAssignmentStates | Where-Object { -not $_.AssignedByGroup }).Count
+                throw ("License removal incomplete. $directLeft directly-assigned license(s) still present after 60s." + $(if ($script:WaitLastError) { " Last check error: $($script:WaitLastError)" }))
+            }
+            Write-Ok 'All directly-assigned licenses removed and verified.'
         }
         $details = "Removed $($skuIds.Count) license SKUs: $($skuIds -join ', ')."
     }

@@ -157,6 +157,24 @@ function Write-Banner {
 
 function Write-Credit { Write-Host '  Developed by Yusha  |  https://yusha.ca' -ForegroundColor DarkCyan }
 
+function Wait-ForCondition {
+    # Poll $Check until it returns truthy or $TimeoutSeconds elapses. Microsoft 365
+    # writes replicate asynchronously, so a single fixed sleep + read can falsely
+    # report failure while the change is still propagating. $true if satisfied in time.
+    param(
+        [Parameter(Mandatory)][scriptblock]$Check,
+        [int]$TimeoutSeconds = 60,
+        [int]$IntervalSeconds = 3
+    )
+    $script:WaitLastError = $null
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try { if (& $Check) { return $true } } catch { $script:WaitLastError = $_ }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds $IntervalSeconds
+    }
+}
+
 function Write-StepHeader {
     param([string]$Title)
     Write-Host ''
@@ -419,9 +437,8 @@ function Restore-Step-Enable {
     Write-StepHeader 'Re-enable sign-in'
     if ($PSCmdlet.ShouldProcess($Upn, 'Set AccountEnabled = true')) {
         Update-MgUser -UserId $Upn -AccountEnabled:$true
-        Start-Sleep -Seconds 2
-        $u = Get-MgUser -UserId $Upn -Property AccountEnabled
-        if (-not $u.AccountEnabled) { throw 'Account is still disabled after the update.' }
+        $confirmed = Wait-ForCondition -Check { (Get-MgUser -UserId $Upn -Property AccountEnabled).AccountEnabled }
+        if (-not $confirmed) { throw 'Account is still disabled 60s after the update.' }
         Write-Ok 'Account is enabled (AccountEnabled = true)'
     }
     Add-AuditEntry -Action 'Re-enable sign-in' -Result 'Success' -Details 'Set AccountEnabled = true.'
@@ -464,11 +481,8 @@ function Restore-Step-AssignLicense {
     $addLicenses = @($SkuIds | ForEach-Object { @{ SkuId = $_ } })
     if ($PSCmdlet.ShouldProcess($Upn, "Assign $($SkuIds.Count) license(s)")) {
         Set-MgUserLicense -UserId $user.Id -AddLicenses $addLicenses -RemoveLicenses @() | Out-Null
-        Start-Sleep -Seconds 3
-        $check = Get-MgUser -UserId $Upn -Property AssignedLicenses
-        if (-not $check.AssignedLicenses -or $check.AssignedLicenses.Count -eq 0) {
-            throw 'License assignment did not take effect.'
-        }
+        $confirmed = Wait-ForCondition -Check { (Get-MgUser -UserId $Upn -Property AssignedLicenses).AssignedLicenses.Count -gt 0 }
+        if (-not $confirmed) { throw ('License assignment did not take effect within 60s.' + $(if ($script:WaitLastError) { " Last check error: $($script:WaitLastError)" })) }
         Write-Ok "Assigned $($SkuIds.Count) license(s)."
     }
     Add-AuditEntry -Action 'Re-assign license' -Result 'Success' -Details "Assigned SKUs: $($SkuIds -join ', ')."
@@ -496,10 +510,11 @@ function Restore-Step-ConvertMailbox {
     }
     if ($PSCmdlet.ShouldProcess($Upn, 'Convert to regular mailbox')) {
         Set-Mailbox -Identity $Upn -Type Regular
-        Start-Sleep -Seconds 3
-        $after = Get-Mailbox -Identity $Upn
-        if ($after.RecipientTypeDetails -ne 'UserMailbox') {
-            throw "Conversion did not complete. RecipientTypeDetails is '$($after.RecipientTypeDetails)'."
+        Write-Action 'Waiting for Exchange to confirm the conversion (up to 2 minutes)...'
+        $confirmed = Wait-ForCondition -TimeoutSeconds 120 -IntervalSeconds 5 -Check { (Get-Mailbox -Identity $Upn).RecipientTypeDetails -eq 'UserMailbox' }
+        if (-not $confirmed) {
+            $current = (Get-Mailbox -Identity $Upn -ErrorAction SilentlyContinue).RecipientTypeDetails
+            throw ("Conversion did not complete within 120s. RecipientTypeDetails is '$current'." + $(if ($script:WaitLastError) { " Last check error: $($script:WaitLastError)" }))
         }
         Write-Ok 'Mailbox converted back to UserMailbox.'
     }
