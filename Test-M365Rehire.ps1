@@ -119,6 +119,7 @@ function Write-Banner {
     Write-Host ''; Write-Host $line -ForegroundColor $Color
     Write-Host $Text -ForegroundColor $Color; Write-Host $line -ForegroundColor $Color
 }
+function Write-Credit  { Write-Host '  Developed by Yusha  |  https://yusha.ca' -ForegroundColor DarkCyan }
 function Write-Info    { param([string]$m); Write-Host "  $m" -ForegroundColor White }
 function Write-Action  { param([string]$m); Write-Host "  > $m" -ForegroundColor Cyan }
 function Write-Ok      { param([string]$m); Write-Host "  [OK] $m" -ForegroundColor Green }
@@ -382,6 +383,8 @@ function Write-RehireReport {
     $obj = [ordered]@{
         tool           = 'Test-M365Rehire'
         schemaVersion  = '1.0'
+        developer      = 'Yusha'
+        developerUrl   = 'https://yusha.ca'
         queriedUpn     = $Upn
         queriedName    = $Name
         verdict        = $Verdict.Verdict
@@ -398,6 +401,7 @@ function Write-RehireReport {
 # Main
 # ================================================================
 function Main {
+    Write-Credit
     if (-not $DisplayName -and -not $UserPrincipalName) {
         if ($Unattended) { throw 'Provide -UserPrincipalName and/or -DisplayName.' }
         Write-Banner 'REHIRE / PRIOR OFFBOARDING CHECK'

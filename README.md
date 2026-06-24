@@ -12,6 +12,8 @@
 
 **One command (or one double-click)** locks an account, cleans up its access, preserves the mailbox as a shared mailbox, and writes a tamper-evident audit packet, with every step backed by Microsoft's own documentation.
 
+Developed by **[Yusha](https://yusha.ca)**
+
 </div>
 
 > [!NOTE]
@@ -392,6 +394,10 @@ Routes: `GET /health`, `POST /preview`, `POST /rehire`, `POST /offboard`, `POST 
 
 The planned feature set is complete. Issues and pull requests are welcome, useful contributions include support for additional authentication-method types as Microsoft Graph adds them, packaging as a PowerShell module, and a CI workflow.
 
+## 👤 Credits
+
+Designed and developed by **[Yusha](https://yusha.ca)**.
+
 ## License
 
-[MIT](LICENSE). Copyright (c) 2026 Yusha.
+[MIT](LICENSE). Copyright (c) 2026 [Yusha](https://yusha.ca).

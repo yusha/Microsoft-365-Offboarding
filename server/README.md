@@ -7,6 +7,8 @@ Two dependency-free PowerShell servers that put the offboarding tools behind an 
 
 Both share `M365OffboardingService.ps1`, which shells out to the existing scripts and returns their `audit.json`. No extra runtime is required, just PowerShell.
 
+Developed by **[Yusha](https://yusha.ca)**.
+
 ## Actions
 
 | Action | Tool / route | Effect | Gated |
