@@ -554,6 +554,7 @@ $script:AuditLog = @()
 # Conditional Access setup decision, made by the pre-step before any destructive step:
 #   'pending' = pre-step did not run (Step 10 sets things up itself, gracefully)
 #   'ready'   = group + policy are in place
+#   'manual'  = operator created the policy in Entra themselves (could not be read back)
 #   'skip'    = operator chose to continue without the CA policy
 #   'abort'   = operator aborted at the pre-step; run no offboarding steps
 $script:CaPolicyDecision = 'pending'
@@ -1239,8 +1240,22 @@ function Invoke-Step10 {
     if ($script:CaPolicyDecision -eq 'skip') {
         $policyOk = $false
         Write-WarnMsg 'No Conditional Access policy (chosen at the pre-step). User is in the group.'
-        $policyNote = "Conditional Access policy was not created by the tool (operator continued without it, or created it manually). The user is in '$OffboardedGroupName'; ensure a block policy targets that group to enforce the sign-in block."
+        $policyNote = "Conditional Access policy was not created by the tool (operator continued without it). The user is in '$OffboardedGroupName'; ensure a block policy targets that group to enforce the sign-in block."
+    } elseif ($script:CaPolicyDecision -eq 'ready' -or $script:CaPolicyDecision -eq 'manual') {
+        # The pre-step already ensured the policy; do NOT recreate it. Just report its
+        # state best-effort (reading also needs the CA scope, so this may be silent).
+        $policy = $null
+        try { $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$($BlockPolicyName -replace "'", "''")'" -ErrorAction SilentlyContinue | Select-Object -First 1 } catch { }
+        if ($policy) {
+            Write-Ok "Conditional Access policy '$BlockPolicyName' in place (state: $($policy.State))."
+            $policyNote = "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
+        } else {
+            $how = if ($script:CaPolicyDecision -eq 'manual') { 'created manually' } else { 'set up in the pre-step' }
+            Write-Ok "Conditional Access policy '$BlockPolicyName' is in place ($how)."
+            $policyNote = "CA policy '$BlockPolicyName' is in place ($how; not re-verified here, as reading it also needs Policy.ReadWrite.ConditionalAccess)."
+        }
     } else {
+        # 'pending': the pre-step did not run (e.g. a direct Step-10 call); set it up here.
         try {
             $policyNameFilter = $BlockPolicyName -replace "'", "''"
             Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
@@ -1719,9 +1734,23 @@ function Confirm-CaInfrastructure {
                     Write-Host '   4. Target resources:  All cloud apps'
                     Write-Host '   5. Grant:  Block access'
                     Write-Host '   6. Enable policy:  Report-only   ->   Create'
-                    Write-Host '  (If I still cannot read it afterward, choose [C] to continue -- the'
-                    Write-Host '   policy you created stays in place and targets the group.)' -ForegroundColor DarkGray
                     Read-Host '  Press ENTER after you have created and saved the policy'
+                    # Re-check. Reading a CA policy ALSO needs Policy.ReadWrite.ConditionalAccess,
+                    # so if we still cannot read it, trust that you created it and continue --
+                    # rather than looping back to the same menu.
+                    try {
+                        $check = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction Stop | Select-Object -First 1
+                        if ($check) {
+                            Write-Ok "Verified: Conditional Access policy '$BlockPolicyName' exists (state: $($check.State))."
+                            $script:CaPolicyDecision = 'ready'
+                            return
+                        }
+                        Write-WarnMsg "I can read Conditional Access policies but do not see '$BlockPolicyName'. Check the exact name, then choose [M] again, or [C] to continue."
+                    } catch {
+                        Write-WarnMsg "I cannot read it back (the read also needs Policy.ReadWrite.ConditionalAccess), so I will trust that you created it and continue."
+                        $script:CaPolicyDecision = 'manual'
+                        return
+                    }
                 }
                 'C' {
                     Write-WarnMsg 'Continuing without the Conditional Access policy. The user is still added to the group.'
