@@ -249,6 +249,9 @@ function Connect-Services {
     if ($appOnly) {
         Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -NoWelcome
     } else {
+        # Disconnect any cached session first so a stale, narrow-scope token is not
+        # reused; a fresh connect requests the full scope set.
+        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
         Connect-MgGraph -Scopes $graphScopes -NoWelcome
     }
     $ctx = Get-MgContext

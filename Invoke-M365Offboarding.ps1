@@ -341,11 +341,30 @@ function Connect-Services {
     if ($appOnly) {
         Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $CertificateThumbprint -NoWelcome
     } else {
+        # Disconnect any cached session first: a stale token from a previous run (or a
+        # narrow by-hand Connect-MgGraph) can be reused and NOT contain every requested
+        # scope, which then surfaces as a confusing 403 deep in the run (e.g. step 10's
+        # Conditional Access call). A fresh connect requests the full scope set.
+        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
         Connect-MgGraph -Scopes $graphScopes -NoWelcome
     }
     $ctx = Get-MgContext
     $operatorId = if ($ctx.Account) { $ctx.Account } else { $ctx.AppName }
     Write-Ok "Connected to Graph as $operatorId in tenant $($ctx.TenantId)"
+
+    # Verify the delegated token actually carries every scope we need. Admin-restricted
+    # scopes (e.g. Policy.ReadWrite.ConditionalAccess) sometimes fail to land in the
+    # token; catch that here at step 0 with the exact names instead of failing mid-run.
+    if (-not $appOnly -and $ctx.Scopes) {
+        $missingScopes = @($graphScopes | Where-Object { $_ -notin $ctx.Scopes })
+        if ($missingScopes.Count) {
+            Write-WarnMsg ("These Microsoft Graph scopes are MISSING from the token: {0}." -f ($missingScopes -join ', '))
+            Write-WarnMsg 'Steps that need them will fail (for example, step 10 needs Policy.ReadWrite.ConditionalAccess).'
+            Write-WarnMsg 'Fix: grant admin consent to "Microsoft Graph Command Line Tools", or re-run Connect-MgGraph with the full scope list and accept the consent, then run again.'
+        } else {
+            Write-Ok 'All required Microsoft Graph scopes are present in the token.'
+        }
+    }
 
     Write-Action 'Connecting to Exchange Online...'
     if ($appOnly) {
