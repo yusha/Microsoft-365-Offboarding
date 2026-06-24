@@ -61,6 +61,13 @@ Developed by **[Yusha](https://yusha.ca)**
 
 **Just want to see what it does?** On Windows, double-click **`demo.bat`** (or run `.\Invoke-M365Offboarding.ps1 -DryRun`). It walks through all ten steps with **no sign-in, no modules, and no changes**, then writes a sample audit packet.
 
+**On Windows you can skip the command line entirely** — double-click the matching `.bat` launcher instead of typing commands. Each opens PowerShell with the right execution policy and forwards any extra parameters you add:
+
+- **`Run-Offboarding.bat`** — offboard a user
+- **`Run-RehireCheck.bat`** — check whether someone was offboarded before
+- **`Run-Reversal.bat`** — undo an offboarding (reversal)
+- **`demo.bat`** — safe, no-sign-in dry-run walkthrough
+
 **Offboard a user (interactive):**
 
 ```powershell
