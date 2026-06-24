@@ -335,6 +335,8 @@ function Connect-Services {
         Write-Info 'Requesting the SharePoint (Sites.ReadWrite.All) scope for the audit packet upload.'
     }
 
+    $script:GraphScopes = $graphScopes  # remembered so the CA pre-step can re-request consent
+
     $appOnly = $ClientId -and $CertificateThumbprint -and $TenantId
 
     Write-Action 'Connecting to Microsoft Graph...'
@@ -549,6 +551,13 @@ function Save-Screenshot {
 # SECTION 5: Audit log
 # ================================================================
 $script:AuditLog = @()
+# Conditional Access setup decision, made by the pre-step before any destructive step:
+#   'pending' = pre-step did not run (Step 10 sets things up itself, gracefully)
+#   'ready'   = group + policy are in place
+#   'skip'    = operator chose to continue without the CA policy
+#   'abort'   = operator aborted at the pre-step; run no offboarding steps
+$script:CaPolicyDecision = 'pending'
+$script:OffboardedGroupId = $null  # resolved by the CA pre-step; reused by Step 10
 
 function Add-AuditEntry {
     param(
@@ -683,6 +692,7 @@ function Get-ResultBadgeClass {
     if ($Result -like 'FAILED*')         { return 'b-fail' }
     if ($Result -like 'Dry run*')         { return 'b-dry' }
     if ($Result -like 'Skipped*')         { return 'b-skip' }
+    if ($Result -like 'Aborted*')         { return 'b-warn' }
     if ($Result -like 'Completed with*')  { return 'b-warn' }
     return 'b-ok'
 }
@@ -968,7 +978,10 @@ function Invoke-Step6 {
     foreach ($g in $groups) {
         if ($g.AdditionalProperties.'@odata.type' -eq '#microsoft.graph.group') {
             $grp = Get-MgGroup -GroupId $g.Id -Property Id, DisplayName, Mail, MailEnabled, GroupTypes, OnPremisesSyncEnabled -ErrorAction SilentlyContinue
-            if ($grp -and -not $grp.OnPremisesSyncEnabled) {
+            if ($grp -and ($grp.Id -eq $script:OffboardedGroupId -or $grp.DisplayName -eq $OffboardedGroupName)) {
+                # Never remove the user from our own Conditional Access block group (Step 10).
+                Write-Info "Keeping membership in '$($grp.DisplayName)' (the offboarded-users CA block group)."
+            } elseif ($grp -and -not $grp.OnPremisesSyncEnabled) {
                 $editableGroups += $grp
             } elseif ($grp -and $grp.OnPremisesSyncEnabled) {
                 Write-WarnMsg "Skipping on-prem-synced group '$($grp.DisplayName)' (remove in on-prem AD)."
@@ -1178,22 +1191,33 @@ function Invoke-Step10 {
     Write-Info 'Defense in depth: even if the account is mistakenly re-enabled,'
     Write-Info 'Conditional Access rejects every sign-in for members of the group.'
 
-    # Escape single quotes for the OData filter (a name like O'Brien would break it).
-    $groupNameFilter = $OffboardedGroupName -replace "'", "''"
-    Write-Action "Looking for security group '$OffboardedGroupName'..."
-    $group = Get-MgGroup -Filter "displayName eq '$groupNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (-not $group) {
-        Write-WarnMsg "Group not found. Creating '$OffboardedGroupName'..."
-        $nickname = ($OffboardedGroupName -replace '[^a-zA-Z0-9]', '').ToLower()
-        if ([string]::IsNullOrWhiteSpace($nickname)) { $nickname = 'offboardedusers' }
-        $group = New-MgGroup -DisplayName $OffboardedGroupName `
-            -Description 'Offboarded users. Targeted by the sign-in block Conditional Access policy.' `
-            -MailEnabled:$false -MailNickname $nickname -SecurityEnabled:$true
-        Write-Ok "Created group '$OffboardedGroupName' (Id: $($group.Id))"
-        Start-Sleep -Seconds 3
-    } else {
-        Write-Ok "Found group '$OffboardedGroupName' (Id: $($group.Id))"
+    if ($script:CaPolicyDecision -eq 'pending') {
+        Write-WarnMsg 'CA pre-step did not run; setting up the group/policy here (after the other steps).'
     }
+
+    # Reuse the exact group the pre-step resolved/created (avoids creating a duplicate
+    # same-named group via a separate display-name lookup). Fall back to a lookup only
+    # if the pre-step did not run.
+    $group = $null
+    if ($script:OffboardedGroupId) {
+        $group = Get-MgGroup -GroupId $script:OffboardedGroupId -ErrorAction SilentlyContinue
+    }
+    if (-not $group) {
+        # Escape single quotes for the OData filter (a name like O'Brien would break it).
+        $groupNameFilter = $OffboardedGroupName -replace "'", "''"
+        Write-Action "Looking for security group '$OffboardedGroupName'..."
+        $group = Get-MgGroup -Filter "displayName eq '$groupNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $group) {
+            Write-WarnMsg "Group not found. Creating '$OffboardedGroupName'..."
+            $nickname = ($OffboardedGroupName -replace '[^a-zA-Z0-9]', '').ToLower()
+            if ([string]::IsNullOrWhiteSpace($nickname)) { $nickname = 'offboardedusers' }
+            $group = New-MgGroup -DisplayName $OffboardedGroupName `
+                -Description 'Offboarded users. Targeted by the sign-in block Conditional Access policy.' `
+                -MailEnabled:$false -MailNickname $nickname -SecurityEnabled:$true
+            Start-Sleep -Seconds 3
+        }
+    }
+    Write-Ok "Group '$OffboardedGroupName' (Id: $($group.Id))"
 
     $user = Get-MgUser -UserId $Upn -Property Id
     Write-Action "Adding $Upn to '$OffboardedGroupName'..."
@@ -1205,43 +1229,49 @@ function Invoke-Step10 {
         else { throw }
     }
 
-    # The Conditional Access policy is optional, report-only defense-in-depth (an admin
-    # must enable it before it enforces anything). The group membership above is the
-    # actual mechanism and already succeeded, so if the CA policy can't be created --
-    # most often a missing Policy.ReadWrite.ConditionalAccess consent -- record a clear
-    # warning instead of a failure that tanks an otherwise-complete offboarding.
+    # The Conditional Access policy (group target above) was set up -- or consciously
+    # skipped -- by the Confirm-CaInfrastructure pre-step BEFORE any destructive step,
+    # so by the time we get here the decision is already made. Honor it: 'skip' -> note
+    # it; otherwise find the policy the pre-step created (or, if the pre-step did not run,
+    # create it best-effort). The group membership above is the durable action.
     $policyOk = $true
     $policyNote = ''
-    try {
-        $policyNameFilter = $BlockPolicyName -replace "'", "''"
-        Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
-        $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $policy) {
-            Write-WarnMsg "Policy not found. Creating in REPORT-ONLY mode. An admin must enable it."
-            $policyBody = @{
-                displayName   = $BlockPolicyName
-                state         = 'enabledForReportingButNotEnforced'
-                conditions    = @{
-                    applications = @{ includeApplications = @('All') }
-                    users        = @{ includeGroups = @($group.Id) }
-                }
-                grantControls = @{ operator = 'OR'; builtInControls = @('block') }
-            }
-            $policy = New-MgIdentityConditionalAccessPolicy -BodyParameter $policyBody -ErrorAction Stop
-            Write-Ok "Created CA policy in report-only mode (Id: $($policy.Id))"
-            Write-WarnMsg 'ACTION REQUIRED: enable this policy in the Entra admin center after review.'
-        } else {
-            Write-Ok "Found CA policy '$BlockPolicyName' (state: $($policy.State))"
-        }
-        $policyNote = "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
-    } catch {
+    if ($script:CaPolicyDecision -eq 'skip') {
         $policyOk = $false
-        Write-ErrMsg "Conditional Access policy was not created: $_"
-        if ("$_" -match 'scopes are missing|AccessDenied|Authorization_RequestDenied|Forbidden|Insufficient privileges') {
-            Write-WarnMsg "This needs Policy.ReadWrite.ConditionalAccess. Sign in again and consent on behalf of the organization, then re-run with -Steps 10."
-            $policyNote = "CA policy NOT created: the Policy.ReadWrite.ConditionalAccess permission is missing/denied. The user is already in '$OffboardedGroupName'; this report-only policy is defense-in-depth and is NOT required for the lockout. Grant the consent (sign in again and consent for the organization) or create the policy manually targeting the group, then run -Steps 10."
-        } else {
-            $policyNote = "CA policy NOT created ($_). The user is already in '$OffboardedGroupName'; create or enable the block policy manually."
+        Write-WarnMsg 'No Conditional Access policy (chosen at the pre-step). User is in the group.'
+        $policyNote = "Conditional Access policy was not created by the tool (operator continued without it, or created it manually). The user is in '$OffboardedGroupName'; ensure a block policy targets that group to enforce the sign-in block."
+    } else {
+        try {
+            $policyNameFilter = $BlockPolicyName -replace "'", "''"
+            Write-Action "Looking for Conditional Access policy '$BlockPolicyName'..."
+            $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $policy) {
+                Write-WarnMsg "Policy not found. Creating in REPORT-ONLY mode. An admin must enable it."
+                $policyBody = @{
+                    displayName   = $BlockPolicyName
+                    state         = 'enabledForReportingButNotEnforced'
+                    conditions    = @{
+                        applications = @{ includeApplications = @('All') }
+                        users        = @{ includeGroups = @($group.Id) }
+                    }
+                    grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+                }
+                $policy = New-MgIdentityConditionalAccessPolicy -BodyParameter $policyBody -ErrorAction Stop
+                Write-Ok "Created CA policy in report-only mode (Id: $($policy.Id))"
+                Write-WarnMsg 'ACTION REQUIRED: enable this policy in the Entra admin center after review.'
+            } else {
+                Write-Ok "Found CA policy '$BlockPolicyName' (state: $($policy.State))"
+            }
+            $policyNote = "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
+        } catch {
+            $policyOk = $false
+            Write-ErrMsg "Conditional Access policy was not created: $_"
+            if ("$_" -match 'scopes are missing|AccessDenied|Authorization_RequestDenied|Forbidden|Insufficient privileges') {
+                Write-WarnMsg "This needs Policy.ReadWrite.ConditionalAccess. Sign in again and consent on behalf of the organization, then re-run with -Steps 10."
+                $policyNote = "CA policy NOT created: the Policy.ReadWrite.ConditionalAccess permission is missing/denied. The user is already in '$OffboardedGroupName'; this report-only policy is defense-in-depth and is NOT required for the lockout. Grant the consent (sign in again and consent for the organization) or create the policy manually targeting the group, then run -Steps 10."
+            } else {
+                $policyNote = "CA policy NOT created ($_). The user is already in '$OffboardedGroupName'; create or enable the block policy manually."
+            }
         }
     }
 
@@ -1588,6 +1618,133 @@ function Remove-AdminRoleAssignments {
     Add-AuditEntry -StepNumber 0 -Action "Removed $($removed.Count) of $($roles.Count) administrative role assignment(s)" -Result $result -Details $details
 }
 
+# ----------------------------------------------------------------
+# Pre-step: set up the Conditional Access block (group + report-only policy) BEFORE
+# the destructive steps run. Creating the policy needs Policy.ReadWrite.ConditionalAccess,
+# an admin-restricted scope that may not be consented. Handling it here means a
+# permission problem is resolved -- or consciously skipped -- while nothing has been
+# changed yet, instead of failing at Step 10 after the mailbox is already shared.
+# Sets $script:CaPolicyDecision to 'ready', 'skip', or 'abort'. Never throws/aborts the
+# offboarding by itself -- a group/policy/permission failure is handled, not fatal.
+# ----------------------------------------------------------------
+function Confirm-CaInfrastructure {
+    Write-Banner 'PRE-STEP: CONDITIONAL ACCESS SETUP'
+    Write-Info 'Preparing the sign-in block group and policy now, before any change, so a'
+    Write-Info 'permission issue is handled up front -- not after the offboarding has run.'
+
+    if ($WhatIfPreference) {
+        Write-Info "[WhatIf] Would ensure group '$OffboardedGroupName' and a report-only policy '$BlockPolicyName' exist."
+        $script:CaPolicyDecision = 'ready'
+        return
+    }
+
+    $createdGroup = $false
+    $groupNameFilter  = $OffboardedGroupName -replace "'", "''"
+    $policyNameFilter = $BlockPolicyName -replace "'", "''"
+
+    # The whole setup (group + policy) is attempted as a unit; ANY failure -- including
+    # the group, so a missing Group.ReadWrite.All never aborts the lockout -- drops into
+    # the operator's options. The CA block is optional, report-only defense in depth.
+    while ($true) {
+        try {
+            $group = Get-MgGroup -Filter "displayName eq '$groupNameFilter'" -ErrorAction Stop | Select-Object -First 1
+            if (-not $group) {
+                Write-Action "Creating security group '$OffboardedGroupName'..."
+                $nickname = ($OffboardedGroupName -replace '[^a-zA-Z0-9]', '').ToLower()
+                if ([string]::IsNullOrWhiteSpace($nickname)) { $nickname = 'offboardedusers' }
+                $group = New-MgGroup -DisplayName $OffboardedGroupName `
+                    -Description 'Offboarded users. Targeted by the sign-in block Conditional Access policy.' `
+                    -MailEnabled:$false -MailNickname $nickname -SecurityEnabled:$true -ErrorAction Stop
+                $createdGroup = $true
+                # Wait until the new group is queryable so Step 10 reuses it (no duplicate).
+                Wait-ForCondition -TimeoutSeconds 30 -Check { [bool](Get-MgGroup -GroupId $group.Id -ErrorAction SilentlyContinue) } | Out-Null
+            }
+            $script:OffboardedGroupId = $group.Id
+            Write-Ok "Group '$OffboardedGroupName' is ready (Id: $($group.Id))."
+
+            $policy = Get-MgIdentityConditionalAccessPolicy -Filter "displayName eq '$policyNameFilter'" -ErrorAction Stop | Select-Object -First 1
+            if ($policy) {
+                Write-Ok "Conditional Access policy '$BlockPolicyName' is in place (state: $($policy.State))."
+            } else {
+                Write-Action "Creating Conditional Access policy '$BlockPolicyName' in REPORT-ONLY mode..."
+                $policyBody = @{
+                    displayName   = $BlockPolicyName
+                    state         = 'enabledForReportingButNotEnforced'
+                    conditions    = @{
+                        applications = @{ includeApplications = @('All') }
+                        users        = @{ includeGroups = @($group.Id) }
+                    }
+                    grantControls = @{ operator = 'OR'; builtInControls = @('block') }
+                }
+                $null = New-MgIdentityConditionalAccessPolicy -BodyParameter $policyBody -ErrorAction Stop
+                Write-Ok "Created the policy in report-only mode. ACTION REQUIRED: enable it in Entra to enforce."
+            }
+            $script:CaPolicyDecision = 'ready'
+            return
+        } catch {
+            Write-ErrMsg "Could not set up the Conditional Access block: $_"
+
+            if ($Unattended) {
+                Write-WarnMsg 'Unattended run: continuing WITHOUT the Conditional Access block (optional, report-only defense in depth).'
+                $script:CaPolicyDecision = 'skip'
+                return
+            }
+
+            $changedNote = if ($createdGroup) { " The group '$OffboardedGroupName' was created and remains (harmless; reused next time)." } else { '' }
+            Write-Host ''
+            Write-Host "  No offboarding steps have run yet.$changedNote" -ForegroundColor Yellow
+            Write-Host '  This usually means the Policy.ReadWrite.ConditionalAccess permission' -ForegroundColor Yellow
+            Write-Host '  was not consented. Choose:' -ForegroundColor Yellow
+            Write-Host '    [R] Retry  - re-open the consent window (tick "Consent on behalf of'
+            Write-Host '                 your organization"), then try again'
+            Write-Host '    [M] Manual - create the policy yourself in Entra; I will show the steps'
+            Write-Host '                 and then re-check'
+            Write-Host '    [C] Continue offboarding WITHOUT the Conditional Access policy'
+            Write-Host '    [A] Abort   - stop now and run no offboarding steps'
+            $choice = (Read-Host '  Choose [R/M/C/A]').ToUpper().Trim()
+            switch ($choice) {
+                'R' {
+                    if ($script:GraphScopes) {
+                        Write-Action 'Re-opening the consent window. Accept it, and tick "Consent on behalf of your organization".'
+                        try { Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null } catch { }
+                        try { Connect-MgGraph -Scopes $script:GraphScopes -NoWelcome } catch { Write-WarnMsg "Sign-in failed: $_" }
+                    }
+                }
+                'M' {
+                    Write-Host ''
+                    Write-Host '  Create the policy in the Entra admin center, then return here:' -ForegroundColor Cyan
+                    Write-Host '   1. https://entra.microsoft.com  ->  Protection  ->  Conditional Access  ->  Policies  ->  + New policy'
+                    Write-Host "   2. Name:  $BlockPolicyName"
+                    Write-Host "   3. Users:  include the group '$OffboardedGroupName'"
+                    Write-Host '   4. Target resources:  All cloud apps'
+                    Write-Host '   5. Grant:  Block access'
+                    Write-Host '   6. Enable policy:  Report-only   ->   Create'
+                    Write-Host '  (If I still cannot read it afterward, choose [C] to continue -- the'
+                    Write-Host '   policy you created stays in place and targets the group.)' -ForegroundColor DarkGray
+                    Read-Host '  Press ENTER after you have created and saved the policy'
+                }
+                'C' {
+                    Write-WarnMsg 'Continuing without the Conditional Access policy. The user is still added to the group.'
+                    $script:CaPolicyDecision = 'skip'
+                    return
+                }
+                'A' {
+                    Write-WarnMsg 'Aborted at the Conditional Access pre-step. No offboarding steps will run.'
+                    $details = if ($createdGroup) {
+                        "Operator aborted at the CA pre-step before any offboarding step. The group '$OffboardedGroupName' was created and remains; no user changes were made."
+                    } else {
+                        'Operator aborted at the CA pre-step before any offboarding step. No changes were made.'
+                    }
+                    Add-AuditEntry -StepNumber 0 -Action 'Aborted at Conditional Access pre-step' -Result 'Aborted by operator' -Details $details
+                    $script:CaPolicyDecision = 'abort'
+                    return
+                }
+                default { Write-WarnMsg 'Enter R, M, C, or A.' }
+            }
+        }
+    }
+}
+
 function Main {
     Initialize-ScreenshotCapability
 
@@ -1707,21 +1864,36 @@ function Main {
         Add-AuditEntry -StepNumber 0 -Action 'Connected to Microsoft Graph and Exchange Online' -Result "Authenticated as $operator" `
             -Details "Target: $upn."
 
-        # Decide which steps to run. Admin roles are stripped first, but only when a
-        # step that disables/manages the account (1 or 2) will actually run -- a
-        # targeted subset like -Steps 7 must NOT silently revoke the user's roles.
+        # Decide which steps to run. Two pre-steps run first, BEFORE anything destructive:
+        # (1) the Conditional Access setup (so a permission issue/abort happens while
+        # nothing has changed), then (2) admin-role removal -- and that one only when a
+        # step that disables/manages the account (1 or 2) will actually run, so a targeted
+        # subset like -Steps 7 does NOT silently revoke the user's roles.
         if ($Unattended -or $All -or $Steps) {
             $toRun = if ($Steps) { $Steps } else { $allSteps }
-            if ($toRun -contains 1 -or $toRun -contains 2) { Remove-AdminRoleAssignments -Upn $upn }
-            Invoke-StepList -Numbers $toRun -Upn $upn -Folder $auditFolder -StopOnError:$false
+            if ($toRun -contains 10) { Confirm-CaInfrastructure }
+            if ($script:CaPolicyDecision -eq 'abort') {
+                Write-WarnMsg 'Offboarding aborted at the Conditional Access pre-step. No offboarding steps were performed.'
+            } else {
+                if ($toRun -contains 1 -or $toRun -contains 2) { Remove-AdminRoleAssignments -Upn $upn }
+                Invoke-StepList -Numbers $toRun -Upn $upn -Folder $auditFolder -StopOnError:$false
+            }
         } else {
             while ($true) {
                 $choice = (Show-StepMenu -Upn $upn).ToUpper().Trim()
                 if ($choice -eq 'Q') { break }
-                if ($choice -eq 'A') { Remove-AdminRoleAssignments -Upn $upn; Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false; break }
+                if ($choice -eq 'A') {
+                    Confirm-CaInfrastructure
+                    if ($script:CaPolicyDecision -eq 'abort') { Write-WarnMsg 'Aborted at the Conditional Access pre-step. No steps were run.'; break }
+                    Remove-AdminRoleAssignments -Upn $upn
+                    Invoke-StepList -Numbers $allSteps -Upn $upn -Folder $auditFolder -StopOnError:$false
+                    break
+                }
                 if ($choice -match '^\d+$' -and [int]$choice -ge 1 -and [int]$choice -le 10) {
                     if ([int]$choice -eq 1 -or [int]$choice -eq 2) { Remove-AdminRoleAssignments -Upn $upn }
-                    Invoke-StepList -Numbers @([int]$choice) -Upn $upn -Folder $auditFolder -StopOnError:$false
+                    if ([int]$choice -eq 10) { Confirm-CaInfrastructure }
+                    if ($script:CaPolicyDecision -eq 'abort') { Write-WarnMsg 'Aborted at the Conditional Access pre-step. Step 10 was not run.' }
+                    else { Invoke-StepList -Numbers @([int]$choice) -Upn $upn -Folder $auditFolder -StopOnError:$false }
                 } else {
                     Write-WarnMsg 'Invalid choice. Use 1-10, A, or Q.'
                 }
