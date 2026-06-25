@@ -197,6 +197,7 @@ if ($PSVersionTable.PSObject.Properties.Name -contains 'Platform') {
 #   'none'     no graphical desktop (for example Azure Cloud Shell)
 $script:ScreenshotMode = 'none'
 $script:ScreenshotTool = $null
+$script:FfmpegPath     = $null
 $script:IsCloudShell   = $false
 $script:HasDisplay     = $false
 $script:TranscriptOn   = $false
@@ -426,23 +427,169 @@ function Get-LinuxPackageManager {
     return $null
 }
 
+function Test-PngFile {
+    # A written PNG sanity check: present, non-trivial, and starts with the PNG signature. Guards
+    # against a truncated/garbage file from a killed or failed ffmpeg. Not a black-frame detector.
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return $false }
+    if ((Get-Item $Path).Length -le 2500) { return $false }
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { $hdr = New-Object byte[] 8; $n = $fs.Read($hdr, 0, 8) } finally { $fs.Dispose() }
+        if ($n -lt 8) { return $false }
+        $sig = @(137, 80, 78, 71, 13, 10, 26, 10)
+        for ($i = 0; $i -lt 8; $i++) { if ($hdr[$i] -ne $sig[$i]) { return $false } }
+        return $true
+    } catch { return $false }
+}
+
+function Invoke-FfmpegBounded {
+    # Runs ffmpeg with a hard timeout so a blocked DXGI duplication (locked / RDP / Session 0 /
+    # static desktop) or a wedged probe can never hang the run -- a timeout is killed and treated
+    # as failure so the caller falls back. Callers pass -nostdin so ffmpeg never touches the
+    # parent's (possibly redirected) stdin. Returns $true if ffmpeg ran to completion within the
+    # timeout, $false if it timed out or failed to launch. The caller confirms ACTUAL success from
+    # ffmpeg's output (the written PNG / captured stdout), since Start-Process -PassThru does not
+    # reliably expose ExitCode on Windows PowerShell.
+    param(
+        [string]$Exe,
+        [string[]]$Arguments,
+        [int]$TimeoutMs = 8000,
+        [string]$StdOutFile
+    )
+    $errFile = Join-Path ([System.IO.Path]::GetTempPath()) ("m365fferr_{0}.txt" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $sp = @{
+            FilePath              = $Exe
+            ArgumentList          = $Arguments
+            NoNewWindow           = $true
+            PassThru              = $true
+            RedirectStandardError = $errFile
+        }
+        if ($StdOutFile) { $sp['RedirectStandardOutput'] = $StdOutFile }
+        $proc = Start-Process @sp
+        if (-not $proc.WaitForExit($TimeoutMs)) {
+            try { $proc.Kill() } catch { }
+            return $false
+        }
+        return $true
+    } catch {
+        return $false
+    } finally {
+        Remove-Item $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-FfmpegWithDdagrab {
+    # Returns the path to an ffmpeg.exe that supports the ddagrab (DXGI Desktop Duplication)
+    # filter, or $null. ddagrab reads the real composited desktop frame, so it captures
+    # GPU-rendered terminals (Windows Terminal, VS Code) accurately, unlike a GDI grab.
+    #
+    # Looks beyond the live PATH so a just-installed ffmpeg (for example `winget install
+    # Gyan.FFmpeg`) is found even when the current session's PATH has not refreshed yet --
+    # otherwise the tool would silently fall back to the laggy built-in capture.
+    $candidates = New-Object System.Collections.Generic.List[string]
+    $cmd = Get-Command ffmpeg -ErrorAction SilentlyContinue
+    if ($cmd) { $candidates.Add($cmd.Source) }
+
+    if ($script:IsWindowsHost) {
+        # WinGet shim + package install locations.
+        $links = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Links\ffmpeg.exe'
+        if (Test-Path $links) { $candidates.Add($links) }
+        $pkgRoot = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+        if (Test-Path $pkgRoot) {
+            Get-ChildItem -Path $pkgRoot -Directory -Filter '*FFmpeg*' -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Get-ChildItem -Path $_.FullName -Filter ffmpeg.exe -Recurse -ErrorAction SilentlyContinue |
+                        ForEach-Object { $candidates.Add($_.FullName) }
+                }
+        }
+        # PATH as recorded in the registry (Machine + User), in case the live session is stale.
+        foreach ($scope in 'Machine', 'User') {
+            $p = [Environment]::GetEnvironmentVariable('Path', $scope)
+            if ($p) {
+                foreach ($dir in ($p -split ';' | Where-Object { $_ })) {
+                    $exe = Join-Path $dir 'ffmpeg.exe'
+                    if (Test-Path $exe) { $candidates.Add($exe) }
+                }
+            }
+        }
+    }
+
+    foreach ($path in ($candidates | Select-Object -Unique)) {
+        $probeOut = Join-Path ([System.IO.Path]::GetTempPath()) ("m365ffprobe_{0}.txt" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $ran = Invoke-FfmpegBounded -Exe $path -Arguments @('-nostdin', '-hide_banner', '-filters') -TimeoutMs 5000 -StdOutFile $probeOut
+            if ($ran -and (Test-Path $probeOut)) {
+                $filters = Get-Content -Path $probeOut -Raw -ErrorAction SilentlyContinue
+                if ($filters -match '\bddagrab\b') { return $path }
+            }
+        } catch { } finally {
+            Remove-Item $probeOut -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $null
+}
+
+function Install-FfmpegForCapture {
+    # Called when the operator opts into screenshots on Windows. ffmpeg's DXGI capture (ddagrab)
+    # records GPU-rendered terminals (Windows Terminal, VS Code) accurately, unlike the built-in
+    # GDI grab. If ffmpeg is not already available, install it automatically with winget, then
+    # re-detect. Best-effort: any failure leaves the built-in capture in place. Updates
+    # $script:FfmpegPath.
+    if (-not $script:IsWindowsHost -or $script:FfmpegPath) { return }
+
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if (-not $winget) {
+        Write-WarnMsg 'ffmpeg gives pixel-accurate screenshots under Windows Terminal but is not installed, and winget was not found to install it automatically. Using the built-in capture (can lag a step under Windows Terminal); install ffmpeg manually for exact frames.'
+        return
+    }
+
+    Write-Info 'ffmpeg not found -- installing it for accurate screenshots (one-time, may take ~30-60s)...'
+    try {
+        & $winget.Source install --id Gyan.FFmpeg -e --silent --accept-source-agreements --accept-package-agreements --disable-interactivity 2>$null
+    } catch { }
+
+    $script:FfmpegPath = Get-FfmpegWithDdagrab
+    if ($script:FfmpegPath) {
+        Write-Ok 'ffmpeg installed -- screenshots will use DXGI capture (accurate under any terminal).'
+    } else {
+        Write-WarnMsg 'Could not install ffmpeg automatically. Using the built-in capture for now; it can lag a step under Windows Terminal.'
+    }
+}
+
 function Initialize-ScreenshotCapability {
     # Decides how (or whether) screenshots can be captured on this platform.
     $script:IsCloudShell = ($env:AZUREPS_HOST_ENVIRONMENT -like 'cloud-shell*') -or [bool]$env:ACC_CLOUD
     $script:HasDisplay   = [bool]($env:DISPLAY -or $env:WAYLAND_DISPLAY)
     $script:ScreenshotMode = 'none'
     $script:ScreenshotTool = $null
+    $script:FfmpegPath     = $null
 
     if ($NoScreenshots) { return }
 
     if ($script:IsWindowsHost) {
+        # Screenshots need a real interactive desktop. In Session 0 / a Windows service / an
+        # Azure Automation hybrid worker / any headless host, System.Windows.Forms still loads
+        # but there is no desktop to capture, so ddagrab and the GDI grab are meaningless (and a
+        # blocked DXGI duplication there could stall an unattended run). Skip capture entirely.
+        if (-not [Environment]::UserInteractive) {
+            $script:ScreenshotMode = 'none'
+            return
+        }
         try {
             Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
             Add-Type -AssemblyName System.Drawing -ErrorAction Stop
             $script:ScreenshotMode = 'windows'
         } catch {
             $script:ScreenshotMode = 'none'
+            return
         }
+        # Prefer ffmpeg's DXGI Desktop Duplication (ddagrab) when installed: it reads the real
+        # composited desktop frame, so per-step screenshots stay accurate under GPU-rendered
+        # terminals (Windows Terminal, VS Code), where the built-in GDI/PrintWindow grab can lag a
+        # step. Falls back to the built-in capture when ffmpeg or ddagrab is unavailable.
+        $script:FfmpegPath = Get-FfmpegWithDdagrab
         return
     }
 
@@ -499,13 +646,45 @@ function Request-ScreenshotToolInstall {
     }
 }
 
+function Save-ScreenshotFfmpeg {
+    param([string]$Path)
+    # Capture the full PRIMARY monitor via DXGI Desktop Duplication (ffmpeg's ddagrab). DXGI returns
+    # the real composited frame, so the capture is current even under GPU-rendered terminals -- no
+    # "one step behind". We deliberately grab the whole monitor rather than cropping to the terminal
+    # window: a window crop relies on per-monitor DPI math and DXGI output mapping that cannot be
+    # made 100% reliable across the varied setups sysadmins run (multi-monitor, mixed DPI,
+    # projectors / extended displays), where it could silently capture the wrong region. The
+    # operator is advised to close private windows and keep the terminal maximized on the primary
+    # monitor. A short burst (6 frames @ 60 fps, hard-capped at 2s) discards ddagrab's occasional
+    # empty first frame while -update overwrites down to the newest frame. hwdownload pulls the frame
+    # off the GPU; format=bgra,format=rgba converts explicitly to the PNG-native layout. Returns
+    # $true only when a valid PNG is written; the caller falls back to PrintWindow/GDI otherwise.
+    if (-not $script:FfmpegPath) { return $false }
+    try {
+        $ffArgs = @(
+            '-nostdin', '-hide_banner', '-loglevel', 'error', '-nostats', '-y',
+            '-filter_complex', 'ddagrab=output_idx=0:framerate=60:draw_mouse=0,hwdownload,format=bgra,format=rgba[out]',
+            '-map', '[out]', '-frames:v', '6', '-update', '1', '-t', '2',
+            $Path
+        )
+        $ran = Invoke-FfmpegBounded -Exe $script:FfmpegPath -Arguments $ffArgs -TimeoutMs 8000
+        if ($ran -and (Test-PngFile $Path)) { return $true }
+    } catch { }
+    if (Test-Path $Path) { Remove-Item $Path -Force -ErrorAction SilentlyContinue }
+    return $false
+}
+
 # The Windows capture lives in its own function so the System.Drawing /
 # System.Windows.Forms type literals are only JIT-compiled when actually called
 # on Windows. Referencing them on a headless host (for example Azure Cloud Shell)
 # would otherwise throw a type-initializer error even on an unreached branch.
 function Save-ScreenshotWindows {
     param([string]$Path)
-    # Prefer PrintWindow(PW_RENDERFULLCONTENT) on the foreground (terminal) window: it asks
+    # Prefer ffmpeg's DXGI capture when it is available (accurate under any terminal); fall
+    # through to the built-in PrintWindow/GDI capture below when it is not present or fails.
+    if (Save-ScreenshotFfmpeg -Path $Path) { return }
+
+    # Then PrintWindow(PW_RENDERFULLCONTENT) on the foreground (terminal) window: it asks
     # the window to render its CURRENT content into the capture, so -- unlike a GDI screen
     # grab, which reads a stale DWM frame -- it is accurate for GPU-rendered terminals like
     # Windows Terminal (no "one step behind"). Falls back to a full-screen grab if it fails.
@@ -579,24 +758,6 @@ function Save-ScreenshotMacOS {
     }
 }
 
-function Wait-EnterOrCountdown {
-    # Waits up to $Seconds, returning early if the operator presses ENTER. Lets manual
-    # screenshot mode auto-advance without requiring a keypress, while still letting the
-    # operator capture sooner. Falls back to a plain sleep if key reading is unavailable.
-    param([int]$Seconds = 2)
-    try {
-        $deadline = (Get-Date).AddSeconds($Seconds)
-        while ((Get-Date) -lt $deadline) {
-            if ([Console]::KeyAvailable) {
-                if ([Console]::ReadKey($true).Key -eq 'Enter') { return }
-            }
-            Start-Sleep -Milliseconds 100
-        }
-    } catch {
-        Start-Sleep -Seconds $Seconds
-    }
-}
-
 function Save-Screenshot {
     param([string]$OutputFolder, [int]$StepNumber, [string]$Label)
 
@@ -606,21 +767,15 @@ function Save-Screenshot {
     $fname = ('step_{0:D2}_{1}_{2}.png' -f $StepNumber, $safe, (Get-Date -Format 'HHmmss'))
     $path = Join-Path $OutputFolder $fname
 
-    if ($script:ScreenshotChoice -eq 'manual') {
-        # Pause so the screen is fully settled before the grab (this is what sidesteps the
-        # Windows Terminal render lag). Auto-captures after a short countdown; pressing
-        # ENTER captures immediately. Either way a real settle precedes the grab.
-        Write-Host "  Capturing the step $StepNumber screenshot in 2s (press ENTER to do it now)..." -ForegroundColor Cyan
-        Wait-EnterOrCountdown -Seconds 2
-    } else {
-        # 'auto' (unattended): no operator to pause for. Under Windows Terminal this grab
-        # can be a step behind (a known WT limitation); a classic console host is exact.
-        if ($script:ScreenshotMode -eq 'windows' -and $env:WT_SESSION -and -not $script:WtScreenshotWarned) {
-            $script:WtScreenshotWarned = $true
-            Write-WarnMsg 'Windows Terminal + automatic screenshots can lag one step behind; the records are exact regardless.'
-        }
-        Start-Sleep -Milliseconds 700
+    # A brief settle so the just-finished step is fully composited before the grab. ffmpeg's DXGI
+    # capture reads the CURRENT frame, so no operator pause, countdown, or keypress is needed --
+    # the capture matches its step. If ffmpeg is not present, warn once that the built-in GDI grab
+    # can lag a step under Windows Terminal (the audit records themselves are exact regardless).
+    if ($script:ScreenshotMode -eq 'windows' -and -not $script:FfmpegPath -and $env:WT_SESSION -and -not $script:WtScreenshotWarned) {
+        $script:WtScreenshotWarned = $true
+        Write-WarnMsg 'Windows Terminal screenshots can lag one step behind without ffmpeg (DXGI capture); the records are exact regardless.'
     }
+    Start-Sleep -Milliseconds 350
 
     try {
         switch ($script:ScreenshotMode) {
@@ -1866,9 +2021,9 @@ function Confirm-CaInfrastructure {
 
 function Main {
     Initialize-ScreenshotCapability
-    # Screenshot behavior: 'none' (off), 'manual' (interactive: auto-captures after a short
-    # countdown, or sooner if you press ENTER), or 'auto' (unattended: automatic). The
-    # interactive prompt below confirms/overrides 'manual'.
+    # Screenshot behavior: 'none' (off), 'manual' (interactive: captured automatically right after
+    # each step), or 'auto' (unattended: automatic). The interactive prompt below confirms it and,
+    # on Windows, installs ffmpeg (accurate DXGI capture) if the operator opts in and it is missing.
     $script:ScreenshotChoice = if ($NoScreenshots -or $script:ScreenshotMode -eq 'none') { 'none' } elseif ($Unattended) { 'auto' } else { 'manual' }
 
     if (-not $Unattended) {
@@ -1890,7 +2045,8 @@ function Main {
             Write-Host '       Conditional Access, and to remove the user''s admin roles).'
             Write-Host '    Note: any admin roles on the target are removed automatically first.'
             if ($script:ScreenshotMode -in @('windows', 'macos', 'linux')) {
-                Write-Host '    3. Close personal windows -- screenshots capture the whole screen.'
+                Write-Host '    3. Screenshots capture your full screen. Close any private windows and keep'
+                Write-Host '       this terminal maximized (on your primary monitor if you use several).'
             }
             Write-Host ''
 
@@ -1923,9 +2079,10 @@ function Main {
             $script:ScreenshotChoice = 'none'
         } else {
             Write-Host ''
-            Write-Host '  Capture a screenshot after each step? Each one is taken automatically a couple'
-            Write-Host '  of seconds after the step finishes (press ENTER to capture sooner) -- you do not'
-            Write-Host '  have to babysit it, and the screen is settled before the grab.'
+            Write-Host '  Capture a screenshot after each step? Each one is captured automatically right'
+            Write-Host '  after the step finishes -- you do not have to do anything. Screenshots capture'
+            Write-Host '  your full screen, so close private windows and keep this terminal maximized'
+            Write-Host '  (on your primary monitor if you have several).'
             if ($script:ScreenshotMode -eq 'macos') {
                 Write-Host '  (macOS: your terminal needs Screen Recording permission in System Settings > Privacy.)' -ForegroundColor DarkGray
             }
@@ -1933,6 +2090,10 @@ function Main {
             $script:ScreenshotChoice = if ($ans -match '^[Nn]') { 'none' } else { 'manual' }
             if ($script:ScreenshotChoice -eq 'none') {
                 Write-Info 'Screenshots off -- the HTML report is generated without a screenshots section.'
+            } elseif ($script:ScreenshotMode -eq 'windows') {
+                # Operator wants screenshots on Windows: ensure ffmpeg (accurate DXGI capture) is
+                # present, installing it automatically if it is missing.
+                Install-FfmpegForCapture
             }
         }
     }

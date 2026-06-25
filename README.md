@@ -310,7 +310,7 @@ cd Microsoft-365-Offboarding
 - **Modules** install once and persist in your Cloud Shell profile.
 - **Screenshots** are not possible (headless, no desktop); the tool says so and records a `transcript.txt` instead. Use `-SharePointSiteUrl` so the packet leaves the session immediately.
 
-On **Windows**, the `Run-Offboarding.bat` / `demo.bat` launchers automatically open in the classic **console host** when started from Windows Terminal, so per-step screenshots capture the correct frame (Windows Terminal's GPU rendering can't be screen-captured accurately). A separate console window opens — no Windows setting to change.
+On **Windows**, screenshots are captured accurately under any terminal — including GPU-rendered ones (Windows Terminal, VS Code) — using **ffmpeg's DXGI Desktop Duplication** (`ddagrab`), which reads the real composited frame. When you opt into screenshots, the tool checks for ffmpeg and, if it is missing, **installs it automatically with winget** (a one-time, ~30–60s download); nothing to set up. If ffmpeg can't be installed (for example winget is unavailable), it falls back to the built-in GDI capture, which can lag one step behind under Windows Terminal — running in the classic **Windows Console Host** also captures exactly.
 
 On a **Linux desktop** (X11/Wayland) screenshots *are* supported via `grim`/`scrot`/`gnome-screenshot`/`import`, and the tool offers to install one if none is present. For fully hands-off runs, see the **Azure Automation runbook** note in [docs/INTEGRATION.md](docs/INTEGRATION.md).
 
