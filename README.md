@@ -111,9 +111,9 @@ Most offboarding mistakes are not dramatic, they are small omissions and orderin
 |:-:|---|---|---|
 | 1 | **Immediate lockout** | Reset password and revoke all sign-in sessions | `Revoke-MgUserSignInSession` |
 | 2 | | Block sign-in (disable the account) | `Update-MgUser -AccountEnabled:$false` |
-| 3 | | Remove ActiveSync mobile device partnerships | `Remove-MobileDevice` |
+| 3 | | Remove ActiveSync partnerships and disable legacy mail protocols | `Remove-MobileDevice`, `Set-CASMailbox` |
 | 4 | **Authorization cleanup** | Remove registered authentication (MFA) methods | `Remove-MgUserAuthentication*Method` |
-| 5 | | Revoke OAuth app grants | `Remove-MgOauth2PermissionGrant` |
+| 5 | | Revoke OAuth grants and review app ownership | `Remove-MgOauth2PermissionGrant`, `Get-MgUserOwnedObject` |
 | 6 | | Remove from groups and distribution lists | `Remove-MgGroupMemberByRef` |
 | 7 | **Mailbox transition & hardening** | Configure forwarding / delegation (optional) | `Set-Mailbox`, `Add-MailboxPermission` |
 | 8 | | Convert the user mailbox to a shared mailbox | `Set-Mailbox -Type Shared` |
@@ -135,9 +135,9 @@ Reference: [Revoke user access in an emergency in Microsoft Entra ID](https://le
 Setting `AccountEnabled` to `false` is Microsoft's first documented step for removing a former employee. It prevents the account from authenticating while leaving it intact so the mailbox can be preserved later.
 References: [Remove a former employee, Step 1](https://learn.microsoft.com/en-us/microsoft-365/admin/add-users/remove-former-employee) and [Revoke user access](https://learn.microsoft.com/en-us/entra/identity/users/users-revoke-access)
 
-**3. Remove ActiveSync mobile device partnerships.**
-A phone or tablet that had the mailbox configured keeps an Exchange ActiveSync partnership. After the password is reset, that partnership keeps attempting to refresh its tokens, which produces repeated failed sign-in attempts and sign-in prompts on the former user's personal device. Removing the partnership with `Remove-MobileDevice` stops this. Microsoft calls this out as part of removing a former employee ("wipe and block a former employee's mobile device").
-References: [Remove a former employee, Step 3](https://learn.microsoft.com/en-us/microsoft-365/admin/add-users/remove-former-employee) and [Remove-MobileDevice](https://learn.microsoft.com/en-us/powershell/module/exchange/remove-mobiledevice)
+**3. Remove ActiveSync partnerships and disable legacy mail protocols.**
+A phone or tablet that had the mailbox configured keeps an Exchange ActiveSync partnership. After the password is reset, that partnership keeps attempting to refresh its tokens, which produces repeated failed sign-in attempts and sign-in prompts on the former user's personal device. Removing the partnership with `Remove-MobileDevice` stops this. The step then disables the legacy mail protocols on the mailbox with `Set-CASMailbox -ImapEnabled $false -PopEnabled $false -ActiveSyncEnabled $false -SmtpClientAuthenticationDisabled $true`, so IMAP, POP, ActiveSync, and authenticated SMTP (the channels an app password or basic-auth client would use) cannot reach the mailbox, even if the account is ever re-enabled. Microsoft calls this out as part of removing a former employee ("wipe and block a former employee's mobile device").
+References: [Remove a former employee, Step 3](https://learn.microsoft.com/en-us/microsoft-365/admin/add-users/remove-former-employee) and [Set-CASMailbox](https://learn.microsoft.com/en-us/powershell/module/exchangepowershell/set-casmailbox)
 
 ### Phase 2: Authorization cleanup
 
@@ -145,8 +145,9 @@ References: [Remove a former employee, Step 3](https://learn.microsoft.com/en-us
 Enumerates the account's authentication methods and deletes each removable one (Microsoft Authenticator, phone, FIDO2 keys, Windows Hello for Business, email, software OATH, Temporary Access Pass). The password method cannot be removed and is left in place. This clears stale MFA registrations so they cannot be reused if the account is ever re-enabled.
 Reference: [Microsoft Graph authentication methods API](https://learn.microsoft.com/en-us/graph/api/resources/authenticationmethods-overview)
 
-**5. Revoke OAuth app grants.**
-Enumerates the user's delegated OAuth2 permission grants and revokes them with `Remove-MgOauth2PermissionGrant`. Without this, third-party and line-of-business apps the user had consented to can retain access tied to the account.
+**5. Revoke OAuth grants and review app ownership.**
+Enumerates the user's delegated OAuth2 permission grants and revokes them with `Remove-MgOauth2PermissionGrant`. Without this, third-party and line-of-business apps the user had consented to can retain access tied to the account. The step then runs an advisory review (`Get-MgUserOwnedObject`) of any app registrations or service principals the user **owns**. An app with its own client secret or certificate plus application permissions authenticates as itself, independent of the user, so it survives the offboarding (an app-only backdoor). These are listed in the console and audit so an admin can remove the user as owner and rotate or remove any unrecognized credentials. The tool does not delete them automatically, because a shared production app could be in use.
+Reference: [App-only access (client credentials)](https://learn.microsoft.com/en-us/graph/auth-v2-service)
 Reference: [Remove-MgOauth2PermissionGrant](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.identity.signins/remove-mgoauth2permissiongrant)
 
 **6. Remove the user from groups and distribution lists.**
@@ -172,7 +173,7 @@ Now safe, because step 8 already preserved the mailbox. `Set-MgUserLicense` remo
 References: [Remove a former employee, Step 6](https://learn.microsoft.com/en-us/microsoft-365/admin/add-users/remove-former-employee) and [Remove licenses with PowerShell](https://learn.microsoft.com/en-us/microsoft-365/enterprise/remove-licenses-from-user-accounts-with-microsoft-365-powershell)
 
 **10. Apply a Conditional Access block on the user principal.**
-Defense in depth. The user is added to a security group ("Offboarded Users" by default) that a Conditional Access policy blocks from all sign-ins. Even if the account is mistakenly re-enabled later, Conditional Access rejects every authentication. On first run the tool creates the group and the policy; the policy is created in report-only mode so a tenant admin reviews and enables it.
+Defense in depth. The user is added to a security group ("Offboarded Users" by default) that a Conditional Access policy blocks from all sign-ins. Even if the account is mistakenly re-enabled later, Conditional Access rejects every authentication. On first run the tool creates the group and the policy; the policy is created in report-only mode so a tenant admin reviews and enables it. Conditional Access requires **Microsoft Entra ID P1** (included in Business Premium and the E plans, but not in Business Standard). On a tenant without P1, the step still adds the user to the group, reports a clear warning that the policy could not be created, and continues; the sign-in block is then enforced by the account being disabled in Step 2.
 Reference: [What is Conditional Access in Microsoft Entra ID](https://learn.microsoft.com/en-us/entra/identity/conditional-access/overview)
 
 </details>

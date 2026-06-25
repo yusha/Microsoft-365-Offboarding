@@ -1101,10 +1101,10 @@ function Invoke-Step2 {
 # ---------- Step 3: Remove mobile device partnerships ----------
 function Invoke-Step3 {
     param([string]$Upn, [string]$Folder)
-    Write-StepHeader 3 'Remove ActiveSync mobile device partnerships'
-    Write-Info 'A cached mobile mail client keeps a device partnership that tries to'
-    Write-Info 'refresh tokens after offboarding. Removing it stops repeated failed'
-    Write-Info 'sign-in attempts (and the sign-in prompts they trigger on the device).'
+    Write-StepHeader 3 'Remove ActiveSync partnerships and disable legacy mail protocols'
+    Write-Info 'A cached mobile mail client keeps a device partnership that tries to refresh'
+    Write-Info 'tokens after offboarding. Removing it, and disabling the legacy mail protocols,'
+    Write-Info 'stops repeated failed sign-ins and closes the app-password / basic-auth path.'
 
     $devices = Get-MobileDevice -Mailbox $Upn -ErrorAction SilentlyContinue
     if ($devices) {
@@ -1124,8 +1124,26 @@ function Invoke-Step3 {
         $details = 'No ActiveSync partnerships were registered for this mailbox.'
     }
 
-    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 3 -Label 'mobile_devices_removed'
-    Add-AuditEntry -StepNumber 3 -Action 'Removed ActiveSync mobile device partnerships' -Result 'Success' -Screenshot $shot -Details $details
+    # Disable the legacy mail protocols on the mailbox so app passwords / basic authentication
+    # (IMAP, POP, ActiveSync, authenticated SMTP) cannot reach it, even if the account is later
+    # re-enabled (a shared-mailbox account, for example). Microsoft has already disabled basic
+    # auth for IMAP/POP tenant-wide; this also turns the protocols off and disables SMTP AUTH.
+    $protoWarn = $false
+    try {
+        if ($PSCmdlet.ShouldProcess($Upn, 'Disable legacy mail protocols (IMAP/POP/ActiveSync/SMTP AUTH)')) {
+            Set-CASMailbox -Identity $Upn -ImapEnabled $false -PopEnabled $false -ActiveSyncEnabled $false -SmtpClientAuthenticationDisabled $true -ErrorAction Stop
+            Write-Ok 'Disabled IMAP, POP, ActiveSync, and authenticated SMTP on the mailbox.'
+        }
+        $details += "`nDisabled legacy mail protocols (IMAP, POP, ActiveSync, SMTP AUTH) via Set-CASMailbox."
+    } catch {
+        $protoWarn = $true
+        Write-WarnMsg "Could not disable legacy mail protocols: $_"
+        $details += "`nLegacy protocol disable failed: $_"
+    }
+
+    $result = if ($protoWarn) { 'Completed with warning: legacy protocols not disabled' } else { 'Success' }
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 3 -Label 'mobile_and_legacy_protocols'
+    Add-AuditEntry -StepNumber 3 -Action 'Removed ActiveSync partnerships and disabled legacy mail protocols' -Result $result -Screenshot $shot -Details $details
 }
 
 # ---------- Step 4: Remove authentication (MFA) methods ----------
@@ -1183,7 +1201,7 @@ function Invoke-Step4 {
 # ---------- Step 5: Revoke OAuth grants ----------
 function Invoke-Step5 {
     param([string]$Upn, [string]$Folder)
-    Write-StepHeader 5 'Revoke OAuth app grants'
+    Write-StepHeader 5 'Revoke OAuth grants and review app ownership'
 
     $user = Get-MgUser -UserId $Upn -Property Id
     $grants = Get-MgUserOauth2PermissionGrant -UserId $user.Id -All -ErrorAction SilentlyContinue
@@ -1207,9 +1225,41 @@ function Invoke-Step5 {
         }
     }
 
+    # App-only backdoor review (advisory; no changes are made here). An app or service principal
+    # the user OWNS can hold its own client secret or certificate plus application permissions, so
+    # it keeps tenant access INDEPENDENT of this user and survives the offboarding. We list these so
+    # an admin can remove the user as owner and rotate or remove any unrecognized credentials. We
+    # deliberately do not delete them automatically, because a shared production app may be in use.
+    $ownedApps = @()
+    try {
+        $owned = Get-MgUserOwnedObject -UserId $user.Id -All -ErrorAction Stop
+        foreach ($o in $owned) {
+            $t = "$($o.AdditionalProperties.'@odata.type')"
+            if ($t -eq '#microsoft.graph.application' -or $t -eq '#microsoft.graph.servicePrincipal') {
+                $kind  = if ($t -eq '#microsoft.graph.application') { 'App registration' } else { 'Service principal' }
+                $name  = $o.AdditionalProperties.displayName
+                $appId = $o.AdditionalProperties.appId
+                $ownedApps += "  - [$kind] $name (AppId: $appId, ObjectId: $($o.Id))"
+            }
+        }
+    } catch {
+        $details += "`nApp-ownership review could not run: $_"
+    }
+    if ($ownedApps.Count) {
+        Write-WarnMsg "REVIEW: this user OWNS $($ownedApps.Count) app registration(s) or service principal(s)."
+        Write-Info 'An app with its own secret/certificate and application permissions keeps access'
+        Write-Info 'after offboarding (an app-only backdoor). Remove the user as owner, and rotate or'
+        Write-Info 'remove any unrecognized client secrets/certificates on these apps.'
+        foreach ($a in $ownedApps) { Write-Host $a -ForegroundColor Yellow }
+        $details += "`nUSER-OWNED APPLICATIONS (review for app-only backdoor; remove ownership and rotate/remove credentials):`n" + ($ownedApps -join "`n")
+    } else {
+        Write-Info 'The user owns no app registrations or service principals.'
+        $details += "`nApp ownership: none found."
+    }
+
     $result = if ($failures -gt 0) { "Completed with $failures failure(s)" } else { 'Success' }
-    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 5 -Label 'oauth_grants_revoked'
-    Add-AuditEntry -StepNumber 5 -Action "Revoked $grantCount OAuth2 grant(s)" -Result $result -Screenshot $shot -Details $details
+    $shot = Save-Screenshot -OutputFolder $Folder -StepNumber 5 -Label 'oauth_grants_and_app_review'
+    Add-AuditEntry -StepNumber 5 -Action "Revoked $grantCount OAuth2 grant(s); reviewed app ownership ($($ownedApps.Count) owned)" -Result $result -Screenshot $shot -Details $details
 }
 
 # ---------- Step 6: Remove from groups ----------
@@ -1525,11 +1575,15 @@ function Invoke-Step10 {
             $policyNote = "CA policy '$BlockPolicyName' (Id: $($policy.Id)), state: $($policy.State)."
         } catch {
             $policyOk = $false
-            Write-ErrMsg "Conditional Access policy was not created: $_"
-            if ("$_" -match 'scopes are missing|AccessDenied|Authorization_RequestDenied|Forbidden|Insufficient privileges') {
+            if ("$_" -match 'licen|premium|entitle|Entra ID P[12]') {
+                Write-WarnMsg 'Conditional Access requires Microsoft Entra ID P1, which this tenant does not have. Skipping the CA policy; the account-disable in Step 2 enforces the sign-in block.'
+                $policyNote = "Conditional Access policy NOT created: Conditional Access requires Microsoft Entra ID P1, which this tenant does not include (for example Microsoft 365 Business Standard). The user is in '$OffboardedGroupName' and is locked out by the disabled account (Step 2), which is the enforcing control. Add Entra ID P1 if you want the report-only CA policy as defense in depth."
+            } elseif ("$_" -match 'scopes are missing|AccessDenied|Authorization_RequestDenied|Forbidden|Insufficient privileges') {
+                Write-ErrMsg "Conditional Access policy was not created: $_"
                 Write-WarnMsg "This needs Policy.ReadWrite.ConditionalAccess. Sign in again and consent on behalf of the organization, then re-run with -Steps 10."
                 $policyNote = "CA policy NOT created: the Policy.ReadWrite.ConditionalAccess permission is missing/denied. The user is already in '$OffboardedGroupName'; this report-only policy is defense-in-depth and is NOT required for the lockout. Grant the consent (sign in again and consent for the organization) or create the policy manually targeting the group, then run -Steps 10."
             } else {
+                Write-ErrMsg "Conditional Access policy was not created: $_"
                 $policyNote = "CA policy NOT created ($_). The user is already in '$OffboardedGroupName'; create or enable the block policy manually."
             }
         }
@@ -1670,18 +1724,18 @@ $script:StepInfo = @{
             Why = 'Prevents the account from authenticating.'
             Cmdlets = 'Update-MgUser -AccountEnabled:$false'
             Sim = 'AccountEnabled set to false.' }
-    3  = @{ Title = 'Remove ActiveSync mobile device partnerships'; Action = 'Removed ActiveSync mobile device partnerships'
-            Why = 'Stops cached mobile clients from repeatedly trying to refresh tokens.'
-            Cmdlets = 'Get-MobileDevice; Remove-MobileDevice'
-            Sim = '2 partnerships would be removed.' }
+    3  = @{ Title = 'Remove ActiveSync partnerships and disable legacy mail protocols'; Action = 'Removed ActiveSync partnerships and disabled legacy mail protocols'
+            Why = 'Stops cached mobile clients retrying, and closes the app-password / basic-auth path (IMAP, POP, ActiveSync, SMTP AUTH).'
+            Cmdlets = 'Get-MobileDevice; Remove-MobileDevice; Set-CASMailbox -ImapEnabled $false -PopEnabled $false -ActiveSyncEnabled $false -SmtpClientAuthenticationDisabled $true'
+            Sim = '2 partnerships would be removed; IMAP/POP/ActiveSync/SMTP AUTH would be disabled on the mailbox.' }
     4  = @{ Title = 'Remove registered authentication (MFA) methods'; Action = 'Removed registered authentication (MFA) methods'
             Why = 'Clears stale MFA registrations.'
             Cmdlets = 'Get-MgUserAuthenticationMethod; Remove-MgUserAuthentication*Method'
             Sim = '2 methods (Authenticator, phone) would be removed; password kept.' }
-    5  = @{ Title = 'Revoke OAuth app grants'; Action = 'Revoked OAuth2 grants'
-            Why = 'Removes third-party app access tied to the account.'
-            Cmdlets = 'Get-MgUserOauth2PermissionGrant; Remove-MgOauth2PermissionGrant'
-            Sim = '2 delegated grants would be revoked.' }
+    5  = @{ Title = 'Revoke OAuth grants and review app ownership'; Action = 'Revoked OAuth2 grants and reviewed app ownership'
+            Why = 'Removes delegated app access, and flags apps the user owns (an app-only secret can be a backdoor that survives offboarding).'
+            Cmdlets = 'Get-MgUserOauth2PermissionGrant; Remove-MgOauth2PermissionGrant; Get-MgUserOwnedObject'
+            Sim = '2 delegated grants would be revoked; user owns 0 app registrations (none to review).' }
     6  = @{ Title = 'Remove from groups and distribution lists'; Action = 'Removed user from cloud-managed groups'
             Why = 'Stops inherited access and mail; on-prem-synced groups are skipped.'
             Cmdlets = 'Get-MgUserMemberOf; Remove-MgGroupMemberByRef'
@@ -1942,6 +1996,11 @@ function Confirm-CaInfrastructure {
             $script:CaPolicyDecision = 'ready'
             return
         } catch {
+            if ("$_" -match 'licen|premium|entitle|Entra ID P[12]') {
+                Write-WarnMsg 'Conditional Access requires Microsoft Entra ID P1, which this tenant does not have (for example Microsoft 365 Business Standard). Skipping the optional CA policy; the account-disable (Step 2) is the enforcing block.'
+                $script:CaPolicyDecision = 'skip'
+                return
+            }
             Write-ErrMsg "Could not set up the Conditional Access block: $_"
 
             if ($Unattended) {
