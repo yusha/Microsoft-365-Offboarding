@@ -524,15 +524,25 @@ function Save-Screenshot {
 
     if ($script:ScreenshotMode -eq 'none') { return $null }
 
+    # Windows Terminal renders on the GPU asynchronously, and a GDI screen grab of it
+    # is structurally ~1 step behind the actual content no matter how long we wait. We
+    # cannot fix that in-process; warn once and point to the exact fix. The audit.json /
+    # AUDIT.md / audit.html records are built from API results and are exact regardless.
+    if ($script:ScreenshotMode -eq 'windows' -and $env:WT_SESSION -and -not $script:WtScreenshotWarned) {
+        $script:WtScreenshotWarned = $true
+        Write-WarnMsg 'Windows Terminal detected: per-step screenshots can lag one step behind.'
+        Write-Info   'For exact screenshots set the default terminal to "Windows Console Host"'
+        Write-Info   '(Terminal Settings > Startup). The audit.json/AUDIT.md/audit.html are exact regardless.'
+    }
+
     $safe = ($Label -replace '[^a-zA-Z0-9_-]', '_')
     $fname = ('step_{0:D2}_{1}_{2}.png' -f $StepNumber, $safe, (Get-Date -Format 'HHmmss'))
     $path = Join-Path $OutputFolder $fname
 
     try {
-        # Windows Terminal renders asynchronously and its viewport can lag the cursor,
-        # so a plain screen grab captures the PREVIOUS step's frame. Nudge it: scroll the
-        # viewport to the cursor (forces a re-render of the latest output at the bottom),
-        # then wait long enough for the GPU/DWM frame to settle before the grab.
+        # Nudge the viewport to the cursor (helps in classic consoles) and let the frame
+        # settle. This is enough for the classic console host; under Windows Terminal the
+        # grab may still be a step behind (see the warning above) -- a known WT limitation.
         try {
             $rui = $Host.UI.RawUI
             $cur = $rui.CursorPosition
@@ -540,7 +550,7 @@ function Save-Screenshot {
             $top = [Math]::Max(0, $cur.Y - $win.Height + 1)
             $rui.WindowPosition = (New-Object System.Management.Automation.Host.Coordinates 0, $top)
         } catch { }
-        Start-Sleep -Milliseconds 2000
+        Start-Sleep -Milliseconds 700
         if ($script:ScreenshotMode -eq 'windows') {
             Save-ScreenshotWindows -Path $path
         } else {
