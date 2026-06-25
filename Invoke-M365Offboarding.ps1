@@ -446,7 +446,14 @@ function Initialize-ScreenshotCapability {
         return
     }
 
-    # Linux/macOS: screenshots need a graphical desktop and a capture tool.
+    # macOS: the built-in `screencapture` tool (the terminal needs Screen Recording
+    # permission in System Settings > Privacy & Security for it to capture anything).
+    if ($IsMacOS) {
+        if (Get-Command screencapture -ErrorAction SilentlyContinue) { $script:ScreenshotMode = 'macos' }
+        return
+    }
+
+    # Linux: screenshots need a graphical desktop and a capture tool.
     if ($script:HasDisplay) {
         $tool = Get-LinuxScreenshotTool
         if ($tool) {
@@ -519,42 +526,62 @@ function Save-ScreenshotLinux {
     if (-not (Test-Path $Path)) { throw "screenshot tool '$($script:ScreenshotTool)' produced no file" }
 }
 
+function Save-ScreenshotMacOS {
+    param([string]$Path)
+    & screencapture -x $Path   # -x = silent; captures the main display
+    if (-not (Test-Path $Path)) {
+        throw 'screencapture produced no file. Grant your terminal Screen Recording permission in System Settings > Privacy & Security, then retry.'
+    }
+}
+
+function Wait-EnterOrCountdown {
+    # Waits up to $Seconds, returning early if the operator presses ENTER. Lets manual
+    # screenshot mode auto-advance without requiring a keypress, while still letting the
+    # operator capture sooner. Falls back to a plain sleep if key reading is unavailable.
+    param([int]$Seconds = 2)
+    try {
+        $deadline = (Get-Date).AddSeconds($Seconds)
+        while ((Get-Date) -lt $deadline) {
+            if ([Console]::KeyAvailable) {
+                if ([Console]::ReadKey($true).Key -eq 'Enter') { return }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    } catch {
+        Start-Sleep -Seconds $Seconds
+    }
+}
+
 function Save-Screenshot {
     param([string]$OutputFolder, [int]$StepNumber, [string]$Label)
 
-    if ($script:ScreenshotMode -eq 'none') { return $null }
-
-    # Windows Terminal renders on the GPU asynchronously, and a GDI screen grab of it
-    # is structurally ~1 step behind the actual content no matter how long we wait. We
-    # cannot fix that in-process; warn once and point to the exact fix. The audit.json /
-    # AUDIT.md / audit.html records are built from API results and are exact regardless.
-    if ($script:ScreenshotMode -eq 'windows' -and $env:WT_SESSION -and -not $script:WtScreenshotWarned) {
-        $script:WtScreenshotWarned = $true
-        Write-WarnMsg 'Windows Terminal detected: per-step screenshots can lag one step behind.'
-        Write-Info   'For exact screenshots set the default terminal to "Windows Console Host"'
-        Write-Info   '(Terminal Settings > Startup). The audit.json/AUDIT.md/audit.html are exact regardless.'
-    }
+    if ($script:ScreenshotChoice -eq 'none' -or $script:ScreenshotMode -eq 'none') { return $null }
 
     $safe = ($Label -replace '[^a-zA-Z0-9_-]', '_')
     $fname = ('step_{0:D2}_{1}_{2}.png' -f $StepNumber, $safe, (Get-Date -Format 'HHmmss'))
     $path = Join-Path $OutputFolder $fname
 
-    try {
-        # Nudge the viewport to the cursor (helps in classic consoles) and let the frame
-        # settle. This is enough for the classic console host; under Windows Terminal the
-        # grab may still be a step behind (see the warning above) -- a known WT limitation.
-        try {
-            $rui = $Host.UI.RawUI
-            $cur = $rui.CursorPosition
-            $win = $rui.WindowSize
-            $top = [Math]::Max(0, $cur.Y - $win.Height + 1)
-            $rui.WindowPosition = (New-Object System.Management.Automation.Host.Coordinates 0, $top)
-        } catch { }
+    if ($script:ScreenshotChoice -eq 'manual') {
+        # Pause so the screen is fully settled before the grab (this is what sidesteps the
+        # Windows Terminal render lag). Auto-captures after a short countdown; pressing
+        # ENTER captures immediately. Either way a real settle precedes the grab.
+        Write-Host "  Capturing the step $StepNumber screenshot in 2s (press ENTER to do it now)..." -ForegroundColor Cyan
+        Wait-EnterOrCountdown -Seconds 2
+    } else {
+        # 'auto' (unattended): no operator to pause for. Under Windows Terminal this grab
+        # can be a step behind (a known WT limitation); a classic console host is exact.
+        if ($script:ScreenshotMode -eq 'windows' -and $env:WT_SESSION -and -not $script:WtScreenshotWarned) {
+            $script:WtScreenshotWarned = $true
+            Write-WarnMsg 'Windows Terminal + automatic screenshots can lag one step behind; the records are exact regardless.'
+        }
         Start-Sleep -Milliseconds 700
-        if ($script:ScreenshotMode -eq 'windows') {
-            Save-ScreenshotWindows -Path $path
-        } else {
-            Save-ScreenshotLinux -Path $path
+    }
+
+    try {
+        switch ($script:ScreenshotMode) {
+            'windows' { Save-ScreenshotWindows -Path $path }
+            'macos'   { Save-ScreenshotMacOS  -Path $path }
+            default   { Save-ScreenshotLinux  -Path $path }
         }
         if (-not (Test-Path $path)) { return $null }
         Write-Ok "Screenshot saved: $fname"
@@ -1794,6 +1821,10 @@ function Confirm-CaInfrastructure {
 
 function Main {
     Initialize-ScreenshotCapability
+    # Screenshot behavior: 'none' (off), 'manual' (interactive: auto-captures after a short
+    # countdown, or sooner if you press ENTER), or 'auto' (unattended: automatic). The
+    # interactive prompt below confirms/overrides 'manual'.
+    $script:ScreenshotChoice = if ($NoScreenshots -or $script:ScreenshotMode -eq 'none') { 'none' } elseif ($Unattended) { 'auto' } else { 'manual' }
 
     if (-not $Unattended) {
         Clear-Host
@@ -1813,24 +1844,10 @@ function Main {
             Write-Host '    2. Sign in as a Global Administrator (required to manage admins,'
             Write-Host '       Conditional Access, and to remove the user''s admin roles).'
             Write-Host '    Note: any admin roles on the target are removed automatically first.'
-            if ($script:ScreenshotMode -eq 'windows') {
-                Write-Host '    3. Close personal windows. Screenshots capture all monitors.'
+            if ($script:ScreenshotMode -in @('windows', 'macos', 'linux')) {
+                Write-Host '    3. Close personal windows -- screenshots capture the whole screen.'
             }
             Write-Host ''
-
-            # Be clear about screenshots when there is no graphical desktop.
-            if ($script:ScreenshotMode -eq 'none' -and -not $NoScreenshots) {
-                if ($script:IsCloudShell) {
-                    Write-WarnMsg 'Running in Azure Cloud Shell: this is a headless environment with no'
-                    Write-Info   'graphical desktop, so per-step screenshots cannot be captured here.'
-                } elseif (-not $script:IsWindowsHost -and -not $script:HasDisplay) {
-                    Write-WarnMsg 'No graphical desktop detected: per-step screenshots cannot be captured.'
-                }
-                Write-Info 'The audit packet will still include AUDIT.md, audit.json, and a text'
-                Write-Info 'transcript of this session. If your audit policy requires images, take a'
-                Write-Info 'screenshot of your own screen (for example the browser) and keep it with'
-                Write-Info 'the ticket, or run the tool on a Windows desktop for automatic screenshots.'
-            }
 
             # On a Linux desktop with no capture tool, offer to install one.
             Request-ScreenshotToolInstall
@@ -1841,6 +1858,38 @@ function Main {
         }
     } elseif ($DryRun) {
         Write-Banner 'DRY RUN / TRAINING MODE - NO CHANGES WILL BE MADE' 'Magenta'
+    }
+
+    # Screenshots: ask interactively whether to capture them, or explain clearly when the
+    # OS/environment cannot. Capable platforms: Windows desktop, macOS (screencapture),
+    # Linux desktop with a tool. Not available: headless (Cloud Shell / SSH, no display).
+    if (-not $Unattended -and -not $NoScreenshots) {
+        if ($script:ScreenshotMode -eq 'none') {
+            if ($script:IsCloudShell) {
+                Write-WarnMsg 'Azure Cloud Shell is headless (no graphical desktop): screenshots are not available here.'
+            } elseif ($IsMacOS) {
+                Write-WarnMsg 'macOS screen capture (screencapture) was not found: screenshots are not available.'
+            } elseif (-not $script:IsWindowsHost -and -not $script:HasDisplay) {
+                Write-WarnMsg 'No graphical desktop detected (headless / SSH): screenshots are not available on this system.'
+            } else {
+                Write-WarnMsg 'Screenshots are not available on this system.'
+            }
+            Write-Info 'Continuing with audit reports only (AUDIT.md, audit.json, audit.html); a text transcript is captured where supported.'
+            $script:ScreenshotChoice = 'none'
+        } else {
+            Write-Host ''
+            Write-Host '  Capture a screenshot after each step? Each one is taken automatically a couple'
+            Write-Host '  of seconds after the step finishes (press ENTER to capture sooner) -- you do not'
+            Write-Host '  have to babysit it, and the screen is settled before the grab.'
+            if ($script:ScreenshotMode -eq 'macos') {
+                Write-Host '  (macOS: your terminal needs Screen Recording permission in System Settings > Privacy.)' -ForegroundColor DarkGray
+            }
+            $ans = Read-Host '  Take screenshots? (Y/n)'
+            $script:ScreenshotChoice = if ($ans -match '^[Nn]') { 'none' } else { 'manual' }
+            if ($script:ScreenshotChoice -eq 'none') {
+                Write-Info 'Screenshots off -- the HTML report is generated without a screenshots section.'
+            }
+        }
     }
 
     # Resolve inputs
