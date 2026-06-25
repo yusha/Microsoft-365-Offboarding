@@ -4,6 +4,13 @@ AUDIT.md
 audit.json
 *.png
 
+# Personal data and activity / sign-in log exports (PII -- never commit)
+*.csv
+*sign-in*log*/
+*signin*log*/
+*_SignIns_*
+*InboxRules*
+
 # Local tooling and secrets
 tools/
 *.pfx
