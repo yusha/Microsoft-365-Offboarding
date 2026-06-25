@@ -505,6 +505,51 @@ function Request-ScreenshotToolInstall {
 # would otherwise throw a type-initializer error even on an unreached branch.
 function Save-ScreenshotWindows {
     param([string]$Path)
+    # Prefer PrintWindow(PW_RENDERFULLCONTENT) on the foreground (terminal) window: it asks
+    # the window to render its CURRENT content into the capture, so -- unlike a GDI screen
+    # grab, which reads a stale DWM frame -- it is accurate for GPU-rendered terminals like
+    # Windows Terminal (no "one step behind"). Falls back to a full-screen grab if it fails.
+    if (-not ('M365WinCap' -as [type])) {
+        try {
+            Add-Type -ReferencedAssemblies ([System.Drawing.Bitmap].Assembly.Location) -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Drawing;
+using System.Drawing.Imaging;
+public static class M365WinCap {
+    [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECT r);
+    [DllImport("user32.dll")] static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+    [StructLayout(LayoutKind.Sequential)] struct RECT { public int Left, Top, Right, Bottom; }
+    public static bool CaptureForeground(string path) {
+        IntPtr h = GetForegroundWindow();
+        if (h == IntPtr.Zero) return false;
+        RECT r;
+        if (!GetWindowRect(h, out r)) return false;
+        int w = r.Right - r.Left, ht = r.Bottom - r.Top;
+        if (w < 50 || ht < 50) return false;
+        using (Bitmap bmp = new Bitmap(w, ht))
+        using (Graphics g = Graphics.FromImage(bmp)) {
+            IntPtr hdc = g.GetHdc();
+            bool ok = PrintWindow(h, hdc, 2u); // PW_RENDERFULLCONTENT
+            g.ReleaseHdc(hdc);
+            if (!ok) return false;
+            bmp.Save(path, ImageFormat.Png);
+            return true;
+        }
+    }
+}
+'@
+        } catch { }
+    }
+
+    $captured = $false
+    if ('M365WinCap' -as [type]) {
+        try { $captured = [M365WinCap]::CaptureForeground($Path) } catch { $captured = $false }
+    }
+    if ($captured -and (Test-Path $Path)) { return }
+
+    # Fallback: full virtual-screen GDI grab (may lag a step under Windows Terminal).
     $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
     $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
     $gfx = [System.Drawing.Graphics]::FromImage($bmp)
