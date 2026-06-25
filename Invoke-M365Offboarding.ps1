@@ -529,10 +529,18 @@ function Save-Screenshot {
     $path = Join-Path $OutputFolder $fname
 
     try {
-        # Let the terminal finish painting the step's output before the screen grab.
-        # Windows Terminal renders asynchronously, so too short a wait captures the
-        # PREVIOUS step's frame (the screenshot ends up one step behind its filename).
-        Start-Sleep -Milliseconds 1000
+        # Windows Terminal renders asynchronously and its viewport can lag the cursor,
+        # so a plain screen grab captures the PREVIOUS step's frame. Nudge it: scroll the
+        # viewport to the cursor (forces a re-render of the latest output at the bottom),
+        # then wait long enough for the GPU/DWM frame to settle before the grab.
+        try {
+            $rui = $Host.UI.RawUI
+            $cur = $rui.CursorPosition
+            $win = $rui.WindowSize
+            $top = [Math]::Max(0, $cur.Y - $win.Height + 1)
+            $rui.WindowPosition = (New-Object System.Management.Automation.Host.Coordinates 0, $top)
+        } catch { }
+        Start-Sleep -Milliseconds 2000
         if ($script:ScreenshotMode -eq 'windows') {
             Save-ScreenshotWindows -Path $path
         } else {
